@@ -36,6 +36,9 @@ var ErrInvalidSecretReference = errors.New("invalid secret reference")
 
 type Provider struct {
 	Client *openbao.Client
+	// FullChain makes pki and pki-role references resolve to the full certificate chain
+	// (leaf certificate followed by its issuing CA chain) instead of only the leaf certificate.
+	FullChain bool
 }
 
 type deployedCertState struct {
@@ -48,8 +51,10 @@ func (p *Provider) Name() string {
 	return Name
 }
 
-// NewProvider creates a new Provider instance for OpenBao and performs login using the provided address and access token.
-func NewProvider(_ context.Context, address, token string) (*Provider, error) {
+// NewProvider creates a new Provider instance for OpenBao and performs login using the provided
+// address and access token. When fullChain is true, pki and pki-role references resolve to the
+// full certificate chain instead of only the leaf certificate.
+func NewProvider(_ context.Context, address, token string, fullChain bool) (*Provider, error) {
 	config := openbao.DefaultConfig()
 
 	config.Address = address
@@ -61,7 +66,7 @@ func NewProvider(_ context.Context, address, token string) (*Provider, error) {
 
 	client.SetToken(token)
 
-	provider := &Provider{Client: client}
+	provider := &Provider{Client: client, FullChain: fullChain}
 
 	return provider, nil
 }
@@ -84,7 +89,12 @@ func (p *Provider) GetSecret(ctx context.Context, ref string) (string, error) {
 			return "", fmt.Errorf("failed to retrieve certificate serial for common name %s: %w", id, err)
 		}
 
-		strValue, err = GetCert(ctx, c, engineName, serial)
+		if p.FullChain {
+			strValue, err = GetCertFullChain(ctx, c, engineName, serial)
+		} else {
+			strValue, err = GetCert(ctx, c, engineName, serial)
+		}
+
 		if err != nil {
 			return "", fmt.Errorf("failed to retrieve certificate with serial %s: %w", id, err)
 		}
@@ -95,7 +105,7 @@ func (p *Provider) GetSecret(ctx context.Context, ref string) (string, error) {
 			return "", fmt.Errorf("failed to issue certificate for common name %s using role %s: %w", id, key, err)
 		}
 
-		strValue = issued.Certificate
+		strValue = issued.PEM(p.FullChain)
 
 	case "kv":
 		strValue, err = GetSecret(ctx, c, engineName, id, key)
@@ -163,7 +173,8 @@ func (p *Provider) GetSecrets(ctx context.Context, refs []string) (map[string]st
 //
 // A pki-role reference (see PKIRoleRefFormat) issues a fresh certificate and its matching private
 // key, and expands into two output entries: envVar holds the certificate PEM, and envVar + PKIRoleKeySuffix
-// (e.g. CERT_KEY) holds the private key PEM.
+// (e.g. CERT_KEY) holds the private key PEM. When the provider has FullChain enabled, the
+// certificate entry holds the leaf certificate followed by its issuing CA chain.
 func (p *Provider) ResolveSecretReferences(ctx context.Context, secrets map[string]string) (secrettypes.ResolvedSecrets, error) {
 	plainSecrets := make(map[string]string, len(secrets))
 	pkiRoleSecrets := make(map[string]string, len(secrets))
@@ -212,7 +223,7 @@ func (p *Provider) ResolveSecretReferences(ctx context.Context, secrets map[stri
 		}
 
 		for envVar, cert := range issued {
-			out[envVar] = cert.Certificate
+			out[envVar] = cert.PEM(p.FullChain)
 			out[envVar+PKIRoleKeySuffix] = cert.PrivateKey
 		}
 	}

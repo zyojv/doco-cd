@@ -11,12 +11,13 @@ tags:
 
 To use OpenBao, you need to set the following environment variables:
 
-| Key                                 | Value                                                           |
-|-------------------------------------|-----------------------------------------------------------------|
-| `SECRET_PROVIDER`                   | `openbao`                                                       |
-| `SECRET_PROVIDER_SITE_URL`          | The URL of the OpenBao instance                                 |
-| `SECRET_PROVIDER_ACCESS_TOKEN`      | Access token for authenticating with the secret provider        |
-| `SECRET_PROVIDER_ACCESS_TOKEN_FILE` | Path to a file containing the access token inside the container |
+| Key                                 | Value                                                                                                                     |
+|-------------------------------------|---------------------------------------------------------------------------------------------------------------------------|
+| `SECRET_PROVIDER`                   | `openbao`                                                                                                                 |
+| `SECRET_PROVIDER_SITE_URL`          | The URL of the OpenBao instance                                                                                           |
+| `SECRET_PROVIDER_ACCESS_TOKEN`      | Access token for authenticating with the secret provider                                                                  |
+| `SECRET_PROVIDER_ACCESS_TOKEN_FILE` | Path to a file containing the access token inside the container                                                           |
+| `SECRET_PROVIDER_PKI_FULLCHAIN`    | Resolve `pki:` and `pki-role:` references to the [full certificate chain](#full-certificate-chain) instead of only the leaf certificate. Default: `false` |
 
 For the environment variables that control [automatic certificate rotation](#automatic-certificate-rotation), see below.
 
@@ -79,6 +80,44 @@ services:
       - source: myapp-example-com.crt
         target: /etc/ssl/certs/example.crt
 ```
+
+## Full certificate chain
+
+By default a `pki:` or `pki-role:` reference resolves to the **leaf certificate only**. Many TLS
+servers (nginx, HAProxy, Traefik, Postgres, …) instead expect a *fullchain* bundle: the leaf
+certificate followed by the intermediate and root CA certificates that signed it, so clients can
+build a complete trust path.
+
+Set `SECRET_PROVIDER_PKI_FULLCHAIN=true` on the doco-cd instance to make every `pki:` and
+`pki-role:` reference resolve to that bundle instead:
+
+```yaml title="compose.yaml (doco-cd itself)"
+services:
+  doco-cd:
+    image: ghcr.io/kimdre/doco-cd:latest
+    environment:
+      SECRET_PROVIDER: openbao
+      SECRET_PROVIDER_SITE_URL: https://openbao.example.com
+      SECRET_PROVIDER_ACCESS_TOKEN: <token>
+      SECRET_PROVIDER_PKI_FULLCHAIN: "true"
+```
+
+The resolved value is a single PEM bundle, with the leaf certificate always first:
+
+```
+-----BEGIN CERTIFICATE-----   <- leaf certificate (the one issued for your common name)
+-----BEGIN CERTIFICATE-----   <- intermediate CA (if any)
+-----BEGIN CERTIFICATE-----   <- root CA
+```
+
+The chain comes from OpenBao's `ca_chain` response field, falling back to `issuing_ca` when the
+mount does not return a chain. For read-only `pki:` references whose response carries no chain,
+the mount's `<secretEngine>/cert/ca_chain` endpoint is read instead.
+
+!!! note
+    The private key exposed under the `_KEY` suffix is unaffected, and the leaf stays the first
+    entry of the bundle. [Automatic certificate rotation](#automatic-certificate-rotation)
+    therefore keeps working unchanged: expiry and serial tracking always read the leaf.
 
 ## Automatic Certificate Rotation
 

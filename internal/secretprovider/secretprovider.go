@@ -115,7 +115,7 @@ func Initialize(ctx context.Context, provider, version string) (SecretProvider, 
 			return nil, cfgErr
 		}
 
-		p, err = openbao.NewProvider(ctx, cfg.SiteUrl, cfg.AccessToken)
+		p, err = openbao.NewProvider(ctx, cfg.SiteUrl, cfg.AccessToken, cfg.PKIFullChain)
 	case webhook.Name:
 		cfg, cfgErr := webhook.GetConfig()
 		if cfgErr != nil {
