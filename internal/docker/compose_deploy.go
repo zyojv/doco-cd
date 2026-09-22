@@ -123,7 +123,7 @@ func deployCompose(ctx context.Context, dockerCli command.Cli, project *types.Pr
 
 	runningServices := set.New[string]()
 
-	if autostartDisabledServices.Len() > 0 {
+	if !autostartDisabledServices.IsEmpty() {
 		containers, err := GetProjectContainers(ctx, dockerCli, project.Name)
 		if err != nil {
 			return fmt.Errorf("failed to inspect existing services before deployment: %w", err)
@@ -141,6 +141,13 @@ func deployCompose(ctx context.Context, dockerCli command.Cli, project *types.Pr
 	if err != nil {
 		return err
 	}
+
+	oneShotServices, err := getOneShotServices(project)
+	if err != nil {
+		return err
+	}
+
+	addOneShotServiceLabels(project, oneShotServices)
 
 	stoppedAutostartServices := autostartDisabledServices.Difference(runningServices)
 
@@ -185,7 +192,7 @@ func deployCompose(ctx context.Context, dockerCli command.Cli, project *types.Pr
 
 		setDeploymentPhase(setPhase, "waiting for services to start")
 
-		err = waitForStartedServices(ctx, dockerCli, project.Name, startServices, jobServices,
+		err = waitForStartedServices(ctx, dockerCli, project.Name, startServices, jobServices, oneShotServices,
 			time.Duration(deployConfig.Timeout)*time.Second)
 		if err != nil {
 			return err

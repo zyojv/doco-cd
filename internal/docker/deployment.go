@@ -18,6 +18,7 @@ import (
 	gitInternal "github.com/kimdre/doco-cd/internal/git"
 	"github.com/kimdre/doco-cd/internal/lock"
 	"github.com/kimdre/doco-cd/internal/prometheus"
+	sourcecache "github.com/kimdre/doco-cd/internal/source/cache"
 	"github.com/kimdre/doco-cd/internal/webhook"
 )
 
@@ -110,19 +111,34 @@ func resolveDeploymentMetricsDeploymentLabel(deployName string) string {
 type DeployRequest struct {
 	JobLog           *slog.Logger `validate:"required,nostructlevel"`
 	ExternalRepoPath string       `validate:"required"`
-	DockerCLI        command.Cli  `validate:"required,nostructlevel"`
+	// InternalRepoPath is the repository's container-internal path.
+	// For a prepared deployment this is the published artifact directory for the deployed revision (Result.PathInternal),
+	// not the repository's top-level directory that Prepare itself locks (with a shared lock,
+	// see sourcecache.AcquireSharedPathLock). DeployStack takes an exclusive lock on this path while loading
+	// the Compose project (which decrypts files in place), so two deployments landing on the exact same
+	// revision never race on the same in-place decryption. Optional: falls back to ExternalRepoPath when empty.
+	InternalRepoPath string
+	DockerCLI        command.Cli `validate:"required,nostructlevel"`
 	Payload          *webhook.ParsedPayload
-	DeployConfig     *deploy.Config `validate:"required,nostructlevel"`
-	DetectedChanges  []Change
-	NeedSignal       []SignalService
-	LatestCommit     string
-	AppVersion       string `validate:"required"`
-	ComposeLoad      ComposeLoadOptions
-	SwarmRetention   SwarmRetentionOptions
-	SwarmMode        bool
-	HashNormMap      map[string]string
-	Project          *types.Project
-	ProjectHash      string
+	// SourceURL is the resolved URL used to fetch/name the source containing
+	// the deploy config. It may differ from Payload.WebURL when a Git host
+	// serves HTTP(S) and SSH on different hosts/ports, and from the active
+	// deployment source when repository_url selects another repository.
+	// It is recorded as cd.doco.source.url so consumers can reconstruct
+	// the config source path without relying on the transient webhook/poll
+	// payload URL.
+	SourceURL       string
+	DeployConfig    *deploy.Config `validate:"required,nostructlevel"`
+	DetectedChanges []Change
+	NeedSignal      []SignalService
+	LatestCommit    string
+	AppVersion      string `validate:"required"`
+	ComposeLoad     ComposeLoadOptions
+	SwarmRetention  SwarmRetentionOptions
+	SwarmMode       bool
+	HashNormMap     map[string]string
+	Project         *types.Project
+	ProjectHash     string
 }
 
 type runtimeDeployRequest struct {
@@ -179,6 +195,15 @@ func DeployStack(ctx context.Context, req DeployRequest) error {
 	if project == nil {
 		deploymentPhase.Set("loading compose configuration")
 
+		// LoadCompose decrypts SOPS-encrypted files in place, so lock the same
+		// path source.Prepare uses to avoid racing a concurrent clone/fetch.
+		lockKey := req.InternalRepoPath
+		if lockKey == "" {
+			lockKey = req.ExternalRepoPath
+		}
+
+		unlockSource := sourcecache.AcquirePathLock(lockKey)
+
 		project, err = LoadCompose(
 			ctx,
 			req.DockerCLI,
@@ -191,6 +216,9 @@ func DeployStack(ctx context.Context, req DeployRequest) error {
 			req.DeployConfig.Internal.Environment,
 			req.ComposeLoad,
 		)
+
+		unlockSource()
+
 		if err != nil {
 			return fmt.Errorf("failed to load compose config: %w", err)
 		}
@@ -233,7 +261,7 @@ func DeployStack(ctx context.Context, req DeployRequest) error {
 	}
 
 	if projectHash == "" {
-		projectHash, err = ProjectHash(WithNormalizedEnvValues(project, req.HashNormMap))
+		projectHash, err = ProjectHash(WithNormalizedEnvValues(project, req.HashNormMap), req.ExternalRepoPath)
 		if err != nil {
 			return fmt.Errorf("failed to generate project hash: %w", err)
 		}

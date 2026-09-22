@@ -15,6 +15,7 @@ import (
 
 	"github.com/kimdre/doco-cd/internal/restapi"
 
+	"github.com/kimdre/doco-cd/internal/common/types/set"
 	"github.com/kimdre/doco-cd/internal/config/app"
 	"github.com/kimdre/doco-cd/internal/config/poll"
 	"github.com/kimdre/doco-cd/internal/controlplane"
@@ -214,7 +215,7 @@ func buildOpenAPIDocument(routes []Route, components *openapi3.Components) (*ope
 	}
 
 	operationIDs := make(map[string]string)
-	referencedTags := make(map[string]bool)
+	referencedTags := set.New[string]()
 
 	for _, route := range routes {
 		for i := range route.Operations {
@@ -232,13 +233,13 @@ func buildOpenAPIDocument(routes []Route, components *openapi3.Components) (*ope
 			document.AddOperation(route.Pattern, metadata.Method, metadata.Operation)
 
 			for _, tag := range metadata.Operation.Tags {
-				referencedTags[tag] = true
+				referencedTags.Add(tag)
 			}
 		}
 	}
 
 	for _, tag := range []string{"Health", "Runs", "Scheduled jobs", "Projects", "Stacks", "Polling", "Webhooks"} {
-		if referencedTags[tag] {
+		if referencedTags.Contains(tag) {
 			document.Tags = append(document.Tags, &openapi3.Tag{
 				Name:        tag,
 				Description: tagDescription(tag),
@@ -353,7 +354,7 @@ func tagDescription(tag string) string {
 // addReferencedSecuritySchemes adds security schemes to the OpenAPI components
 // based on the referenced security requirements in the provided routes.
 func addReferencedSecuritySchemes(components *openapi3.Components, routes []Route) {
-	referenced := make(map[string]bool)
+	referenced := set.New[string]()
 
 	for _, route := range routes {
 		for _, metadata := range route.Operations {
@@ -363,13 +364,13 @@ func addReferencedSecuritySchemes(components *openapi3.Components, routes []Rout
 
 			for _, requirement := range *metadata.Operation.Security {
 				for name := range requirement {
-					referenced[name] = true
+					referenced.Add(name)
 				}
 			}
 		}
 	}
 
-	if referenced[apiKeySecurityScheme] {
+	if referenced.Contains(apiKeySecurityScheme) {
 		components.SecuritySchemes[apiKeySecurityScheme] = &openapi3.SecuritySchemeRef{
 			Value: openapi3.NewSecurityScheme().
 				WithType("apiKey").
@@ -387,7 +388,7 @@ func addReferencedSecuritySchemes(components *openapi3.Components, routes []Rout
 		"ForgejoSignature": webhook.ScmProviderSecurityHeaders[webhook.Forgejo],
 		"OCISignature":     webhook.ScmProviderSecurityHeaders[webhook.OCIRegistry],
 	} {
-		if !referenced[name] {
+		if !referenced.Contains(name) {
 			continue
 		}
 
@@ -665,7 +666,7 @@ func createRouteCatalog(h *Handler, mounts Mounts, builder *schemaBuilder) ([]Ro
 		return nil, err
 	}
 
-	mutationResponses, err := standardResponses(builder, map[int]*openapi3.ResponseRef{http.StatusOK: stringResponse}, http.StatusBadRequest, http.StatusUnauthorized, http.StatusNotFound, http.StatusInternalServerError, http.StatusMethodNotAllowed)
+	mutationResponses, err := standardResponses(builder, map[int]*openapi3.ResponseRef{http.StatusOK: stringResponse}, http.StatusBadRequest, http.StatusUnauthorized, http.StatusNotFound, http.StatusConflict, http.StatusInternalServerError, http.StatusMethodNotAllowed)
 	if err != nil {
 		return nil, err
 	}
@@ -799,9 +800,10 @@ func createRouteCatalog(h *Handler, mounts Mounts, builder *schemaBuilder) ([]Ro
 			Operations: []Operation{
 				operation(http.MethodPost, "runComposeProjectAction", "Run a Compose project action", []string{"Projects"}, openapi3.Parameters{
 					pathParameter("projectName", "Compose project name."),
-					pathParameter("action", "Lifecycle action.", "start", "stop", "restart"),
+					pathParameter("action", "Lifecycle action.", "start", "stop", "restart", "recreate"),
 					contextParameter(),
 					timeout,
+					queryStringParameter("service", "Optional service name for recreate action."),
 				}, nil, responses(mutationResponses), apiAuth),
 			},
 		},

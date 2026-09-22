@@ -3,14 +3,17 @@ package scheduler
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/docker/compose/v5/pkg/api"
 	"github.com/moby/moby/api/types/container"
+	swarmTypes "github.com/moby/moby/api/types/swarm"
 	"github.com/moby/moby/client"
 
+	"github.com/kimdre/doco-cd/internal/common/types/set"
 	"github.com/kimdre/doco-cd/internal/docker"
 	"github.com/kimdre/doco-cd/internal/docker/swarm"
 )
@@ -27,6 +30,10 @@ func (s *scheduler) discoverJobs(ctx context.Context) ([]scheduledJob, error) {
 		}
 
 		result := make([]scheduledJob, 0, len(services.Items))
+		jobIndexByServiceID := make(map[string]int, len(services.Items))
+		jobIndexByServiceName := make(map[string]int, len(services.Items))
+		ephemeralServices := make([]swarmTypes.Service, 0)
+
 		for _, svc := range services.Items {
 			// Deployment metadata and job runtime metadata are read from the service
 			// spec, but the job configuration itself must come from the task template
@@ -34,7 +41,13 @@ func (s *scheduler) discoverJobs(ctx context.Context) ([]scheduledJob, error) {
 			// from. Picking up job config labels from the service spec here would
 			// schedule services that the deploy path does not treat as jobs.
 			labels := docker.SwarmJobLabels(svc)
+			if isEphemeralScheduledContainer(labels) {
+				ephemeralServices = append(ephemeralServices, svc)
+				continue
+			}
 
+			jobIndexByServiceID[svc.ID] = len(result)
+			jobIndexByServiceName[svc.Spec.Name] = len(result)
 			result = append(result, scheduledJob{
 				key:     jobKeyPrefix(s.contextName) + "swarm:" + svc.ID,
 				name:    svc.Spec.Name,
@@ -43,6 +56,34 @@ func (s *scheduler) discoverJobs(ctx context.Context) ([]scheduledJob, error) {
 				labels:  labels,
 				context: s.contextName,
 			})
+		}
+
+		for _, svc := range ephemeralServices {
+			active, taskErr := isActiveSwarmEphemeralService(ctx, s.dockerCli.Client(), svc.ID)
+			if taskErr != nil {
+				return nil, fmt.Errorf("list tasks for ephemeral service %s: %w", svc.Spec.Name, taskErr)
+			}
+
+			if !active {
+				continue
+			}
+
+			labels := docker.SwarmJobLabels(svc)
+
+			sourceID := strings.TrimSpace(labels[docker.DocoCDJobLabels.JobSourceServiceID])
+			if index, ok := jobIndexByServiceID[sourceID]; ok {
+				result[index].running = true
+				continue
+			}
+
+			sourceName := strings.TrimSpace(svc.Spec.Name)
+			if index := strings.LastIndex(sourceName, "-doco-job-"); index > 0 {
+				sourceName = sourceName[:index]
+			}
+
+			if index, ok := jobIndexByServiceName[sourceName]; ok {
+				result[index].running = true
+			}
 		}
 
 		return result, nil
@@ -57,7 +98,7 @@ func (s *scheduler) discoverJobs(ctx context.Context) ([]scheduledJob, error) {
 	}
 
 	jobByKey := make(map[string]scheduledJob)
-	runningEphemeralByKey := make(map[string]bool)
+	runningEphemeralByKey := set.New[string]()
 
 	for _, c := range containers.Items {
 		// A Swarm task is represented as a container too. On a Swarm manager it
@@ -75,7 +116,7 @@ func (s *scheduler) discoverJobs(ctx context.Context) ([]scheduledJob, error) {
 		// currently executing.
 		if isEphemeralScheduledContainer(c.Labels) {
 			if c.State == container.StateRunning {
-				runningEphemeralByKey[key] = true
+				runningEphemeralByKey.Add(key)
 			}
 
 			continue
@@ -105,11 +146,36 @@ func (s *scheduler) discoverJobs(ctx context.Context) ([]scheduledJob, error) {
 
 	result := make([]scheduledJob, 0, len(jobByKey))
 	for key, job := range jobByKey {
-		job.running = runningEphemeralByKey[key]
+		job.running = runningEphemeralByKey.Contains(key)
 		result = append(result, job)
 	}
 
 	return result, nil
+}
+
+func isActiveSwarmEphemeralService(ctx context.Context, apiClient client.APIClient, serviceID string) (bool, error) {
+	tasks, err := apiClient.TaskList(ctx, client.TaskListOptions{
+		Filters: make(client.Filters).Add("service", serviceID),
+	})
+	if err != nil {
+		return false, err
+	}
+
+	if slices.ContainsFunc(tasks.Items, isActiveSwarmTask) {
+		return true, nil
+	}
+
+	return false, nil
+}
+
+func isActiveSwarmTask(task swarmTypes.Task) bool {
+	switch task.Status.State {
+	case swarmTypes.TaskStateComplete, swarmTypes.TaskStateShutdown, swarmTypes.TaskStateFailed,
+		swarmTypes.TaskStateRejected, swarmTypes.TaskStateOrphaned, swarmTypes.TaskStateRemove:
+		return false
+	default:
+		return true
+	}
 }
 
 func getScheduleFingerprint(cfg docker.JobScheduleConfig) string {

@@ -24,6 +24,7 @@ import (
 	"github.com/kimdre/doco-cd/internal/config/deploy"
 	"github.com/kimdre/doco-cd/internal/docker"
 	"github.com/kimdre/doco-cd/internal/logger"
+	"github.com/kimdre/doco-cd/internal/migration"
 	"github.com/kimdre/doco-cd/internal/notification"
 
 	gitInternal "github.com/kimdre/doco-cd/internal/git"
@@ -126,14 +127,29 @@ type Stages struct {
 
 // RepositoryData holds information about the triggering repository.
 type RepositoryData struct {
-	Source       types2.SourceType // Source backend used for this deployment (git or oci)
-	SourceUrl    string            // Repository or OCI artifact URL (e.g., "https://github.com/user/my-repo.git" or "ghcr.io/org/repo:tag")
-	Name         string            // Repository name (e.g., "user/my-repo")
-	PathInternal string            // Path to the repository inside the container
-	PathExternal string            // Path to the repository on the host machine
-	Git          *git.Repository   // Git repository instance
-	Revision     string            // Resolved immutable revision (commit SHA or digest)
-	OCITrusted   bool              // True when the OCI artifact passed trust-policy verification before reconciliation/cleanup
+	Source            types2.SourceType // Source backend used for this deployment (git or oci)
+	SourceUrl         string            // Repository or OCI artifact URL used for the deployment
+	ConfigSourceUrl   string            // Resolved URL of the repository or artifact containing the deploy config
+	Name              string            // Repository name (e.g., "user/my-repo")
+	PathInternal      string            // Path to the repository inside the container
+	PathExternal      string            // Path to the repository on the host machine
+	MirrorDir         string            // Path of the bare mirror clone backing git reads; empty for OCI sources
+	Revision          string            // Resolved immutable revision (commit SHA or digest)
+	ResolvedReference string            // Reference that Revision/MirrorDir were resolved against (e.g., the branch/tag from the triggering job); empty for OCI sources
+	ConfigRevision    string            // Immutable revision containing the deploy config
+	ConfigPath        string            // Host path to the config source artifact
+	OCITrusted        bool              // True when the OCI artifact passed trust-policy verification before reconciliation/cleanup
+}
+
+// SchedulerStopHolds reports whether a Compose service is currently held
+// stopped by doco-cd's own job scheduler, i.e. a scheduled job listed it in
+// cd.doco.job.stop_services and has not restarted it yet (the post-release
+// grace period counts as held too).
+//
+// Holds are only registered for Compose-mode jobs, keyed by Docker context,
+// Compose project and service name.
+type SchedulerStopHolds interface {
+	IsSchedulerStopHeld(contextName, project, service string) bool
 }
 
 // Docker holds the Docker CLI and client instances along with the data mount point.
@@ -151,6 +167,7 @@ type DeploymentState struct {
 	changedServices      []docker.Change
 	imageChangedServices []string // services whose image moved: digest drift under force_image_pull, otherwise a changed image reference
 	ignoredInfo          docker.IgnoredInfo
+	modeMigrationNeeded  bool
 	DeployedCommit       string // previously-deployed commit SHA, carried to post-deploy for the changelog
 	latestCommit         string // current commit SHA, resolved during pre-deploy for reuse by deploy
 }
@@ -186,18 +203,42 @@ type StageManager struct {
 	Docker         *Docker
 	Payload        *webhook.ParsedPayload
 	Repository     *RepositoryData
+	GitChanges     *GitChangeCache
+	GitAncestry    *GitAncestryCache
 	SecretProvider secretprovider.SecretProvider
 	Notifier       notification.Sender
 	Metadata       notification.Metadata // Notification metadata (may include reconciliation event info)
+	// SchedulerHolds is optional; a nil value means no scheduler stop holds are tracked.
+	SchedulerHolds SchedulerStopHolds
+	// Contexts is the Docker context registry used by the cleanup stage to check whether legacy
+	// on-disk leftovers are still referenced by a running container in any configured context.
+	// A nil value disables the retry (the cleanup stage then only logs and continues).
+	Contexts *docker.ContextRegistry
+	// LeftoverTracker remembers repository directories already confirmed free of legacy
+	// leftovers, so the cleanup stage can skip redundant checks for them. A nil value disables
+	// the short-circuit (every run is checked from scratch).
+	LeftoverTracker *migration.LeftoverTracker
+	releaseGCLock   func()
 }
 
 // Dependencies holds the stable services shared by every StageManager run in a process:
 // application configuration, the optional secret provider used to resolve external secret
 // references, and the notifier used for deployment lifecycle messages.
 type Dependencies struct {
-	AppConfig      *app.Config `validate:"required,nostructlevel"`
-	SecretProvider secretprovider.SecretProvider
-	Notifier       notification.Sender `validate:"required,nostructlevel"`
+	AppConfig      *app.Config                   `validate:"required,nostructlevel"`
+	SecretProvider secretprovider.SecretProvider `validate:"omitempty,nostructlevel"`
+	Notifier       notification.Sender           `validate:"required,nostructlevel"`
+	// SchedulerHolds lets the pre-deploy stage ask whether a service is intentionally stopped by a running scheduled job.
+	// A nil value disables the check. nostructlevel keeps the validator from recursing into the
+	// concrete implementation (typically *reconciliation.Manager), which has
+	// its own concurrently-locked internal state and races under -race if walked via reflection.
+	SchedulerHolds SchedulerStopHolds `validate:"omitempty,nostructlevel"`
+	// Contexts and LeftoverTracker are used by the cleanup stage to retry removal of legacy
+	// on-disk leftovers left behind after migration (see internal/migration). Both are optional;
+	// a nil Contexts disables the retry entirely, and a nil LeftoverTracker just disables the
+	// in-memory short-circuit for repositories already confirmed clean.
+	Contexts        *docker.ContextRegistry `validate:"omitempty,nostructlevel"`
+	LeftoverTracker *migration.LeftoverTracker
 }
 
 // RunInput holds the per-deployment input for a single StageManager run: the job identity and
@@ -212,6 +253,8 @@ type RunInput struct {
 	Payload      *webhook.ParsedPayload
 	DeployConfig *deploy.Config `validate:"required,nostructlevel"`
 	Metadata     notification.Metadata
+	GitChanges   *GitChangeCache
+	GitAncestry  *GitAncestryCache
 }
 
 // NewStageManager validates dependencies and run, then creates and initializes a new
@@ -226,18 +269,23 @@ func NewStageManager(dependencies Dependencies, run RunInput) (*StageManager, er
 	}
 
 	return &StageManager{
-		Log:            run.Log.With(),
-		JobID:          run.JobID,
-		JobTrigger:     run.JobTrigger,
-		AppConfig:      dependencies.AppConfig,
-		DeployConfig:   run.DeployConfig,
-		DeployState:    &DeploymentState{},
-		Docker:         run.Docker,
-		Payload:        run.Payload,
-		Repository:     run.Repository,
-		SecretProvider: dependencies.SecretProvider,
-		Notifier:       dependencies.Notifier,
-		Metadata:       run.Metadata,
+		Log:             run.Log.With(),
+		JobID:           run.JobID,
+		JobTrigger:      run.JobTrigger,
+		AppConfig:       dependencies.AppConfig,
+		DeployConfig:    run.DeployConfig,
+		DeployState:     &DeploymentState{},
+		Docker:          run.Docker,
+		Payload:         run.Payload,
+		Repository:      run.Repository,
+		GitChanges:      run.GitChanges,
+		GitAncestry:     run.GitAncestry,
+		SecretProvider:  dependencies.SecretProvider,
+		Notifier:        dependencies.Notifier,
+		SchedulerHolds:  dependencies.SchedulerHolds,
+		Metadata:        run.Metadata,
+		Contexts:        dependencies.Contexts,
+		LeftoverTracker: dependencies.LeftoverTracker,
 		Stages: &Stages{
 			Init: &InitStageData{
 				MetaData: NewMetaData(StageInit),
@@ -286,30 +334,79 @@ func (s *StageManager) GetStageMetaData(stageName StageName) (*MetaData, error) 
 	}
 }
 
+// hasGitMirror reports whether this deployment has a bare mirror to read git
+// history from. OCI sources never do, and neither does a deployment whose init
+// stage has not resolved one yet.
+func (s *StageManager) hasGitMirror() bool {
+	return s.Repository.MirrorDir != ""
+}
+
+// withMirrorRead runs fn against a freshly opened handle on this deployment's bare
+// mirror while holding the mirror's shared read lock.
+//
+// The handle deliberately does not outlive fn. Retaining one across lock regions is
+// what crashed doco-cd: go-git caches a repository handle's packfile index map on
+// first use and never refreshes it, so once a concurrent job fetches into the same
+// mirror the retained handle enumerates a packfile it has no index for and
+// segfaults inside packfile.GetByType. See git.WithMirrorRead for the full
+// mechanism. Batch every read of one logical region into a single call so the
+// region shares one handle and one lock acquisition.
+func (s *StageManager) withMirrorRead(fn func(repo *git.Repository) error) error {
+	return gitInternal.WithMirrorRead(s.Repository.MirrorDir, fn)
+}
+
+// mirrorRead is the value-returning form of StageManager.withMirrorRead.
+func mirrorRead[T any](s *StageManager, fn func(repo *git.Repository) (T, error)) (T, error) {
+	return gitInternal.MirrorRead(s.Repository.MirrorDir, fn)
+}
+
+// latestCommitFromMirror resolves the deploy config's reference to a commit SHA
+// using a scoped mirror read.
+func (s *StageManager) latestCommitFromMirror() (string, error) {
+	return mirrorRead(s, func(repo *git.Repository) (string, error) {
+		return gitInternal.GetLatestCommit(repo, s.DeployConfig.Reference)
+	})
+}
+
+// notificationCommitSha resolves the short commit SHA shown in notifications.
+// It always prefers the immutable revision published for this deployment over the
+// mirror's moving branch, which another webhook may already have advanced.
+func (s *StageManager) notificationCommitSha() string {
+	fullSHA := strings.TrimSpace(s.Repository.Revision)
+	if !s.hasGitMirror() {
+		return fullSHA
+	}
+
+	commitSha, err := mirrorRead(s, func(repo *git.Repository) (string, error) {
+		if fullSHA == "" {
+			var resolveErr error
+
+			fullSHA, resolveErr = gitInternal.GetLatestCommit(repo, s.DeployConfig.Reference)
+			if resolveErr != nil {
+				return "", resolveErr
+			}
+		}
+
+		shortSha, shortErr := gitInternal.GetShortestUniqueCommitHash(repo, fullSHA, gitInternal.DefaultShortSHALength)
+		if shortErr != nil {
+			// Shortening is cosmetic: fall back to the full SHA rather than failing
+			// the notification over it.
+			return fullSHA, nil //nolint:nilerr // intentional degradation
+		}
+
+		return shortSha, nil
+	})
+	if err != nil {
+		return fullSHA
+	}
+
+	return commitSha
+}
+
 // NotifyFailure sends a failure notification and returns notifyErr marked as already
 // reported, so the caller does not notify about the same failure a second time.
 func (s *StageManager) NotifyFailure(notifyErr error) error {
-	var (
-		latestCommit string
-		commitErr    error
-		commitSha    string
-	)
-
-	if s.Repository.Git != nil {
-		latestCommit, commitErr = gitInternal.GetLatestCommit(s.Repository.Git, s.DeployConfig.Reference)
-		if commitErr != nil {
-			latestCommit = ""
-		}
-
-		commitSha, commitErr = gitInternal.GetShortestUniqueCommitHash(s.Repository.Git, latestCommit, gitInternal.DefaultShortSHALength)
-		if commitErr != nil {
-			commitSha = latestCommit
-		}
-	}
-
-	if s.Repository.Git == nil {
-		commitSha = strings.TrimSpace(s.Repository.Revision)
-	}
+	commitSha := s.notificationCommitSha()
 
 	revision := notification.GetRevision(s.DeployConfig.Reference, commitSha)
 
@@ -340,25 +437,7 @@ func (s *StageManager) NotifyFailure(notifyErr error) error {
 }
 
 func (s *StageManager) NotifyDeploymentStarted() error {
-	var (
-		latestCommit string
-		commitErr    error
-		commitSha    string
-	)
-
-	if s.Repository.Git != nil {
-		latestCommit, commitErr = gitInternal.GetLatestCommit(s.Repository.Git, s.DeployConfig.Reference)
-		if commitErr == nil {
-			commitSha, commitErr = gitInternal.GetShortestUniqueCommitHash(s.Repository.Git, latestCommit, gitInternal.DefaultShortSHALength)
-			if commitErr != nil {
-				commitSha = latestCommit
-			}
-		}
-	}
-
-	if s.Repository.Git == nil {
-		commitSha = strings.TrimSpace(s.Repository.Revision)
-	}
+	commitSha := s.notificationCommitSha()
 
 	revision := notification.GetRevision(s.DeployConfig.Reference, commitSha)
 
@@ -387,9 +466,9 @@ func (s *StageManager) resolveCommitSHA() string {
 		return "" // OCI digests are not git commit SHAs
 	}
 
-	// Prefer the full SHA from the local git repository when available.
-	if s.Repository.Git != nil {
-		sha, err := gitInternal.GetLatestCommit(s.Repository.Git, s.DeployConfig.Reference)
+	// Prefer the full SHA from the local git mirror when available.
+	if s.hasGitMirror() {
+		sha, err := s.latestCommitFromMirror()
 		if err == nil && strings.TrimSpace(sha) != "" {
 			return strings.TrimSpace(sha)
 		}
@@ -496,4 +575,58 @@ func (s *StageManager) PostCommitStatus(ctx context.Context, state commitstatus.
 
 		s.Log.Warn("failed to post commit status", slog.String("error", err.Error()))
 	}
+}
+
+// sourceLockKey returns the key used to serialize in-place mutation of this
+// deployment's published artifact directory: LoadCompose decrypts
+// SOPS-encrypted files in place there, so two deployments landing on the
+// same revision (the same artifact directory) must agree on this key to
+// exclude each other. It is a different, finer-grained key than the one
+// source.Prepare locks (the repository's top-level directory, guarding
+// against a concurrent destroy rather than against decrypt races).
+func (s *StageManager) sourceLockKey() string {
+	if s.Repository == nil {
+		return ""
+	}
+
+	if s.Repository.PathInternal != "" {
+		return s.Repository.PathInternal
+	}
+
+	return s.Repository.PathExternal
+}
+
+// migrationSource returns the source identity used to prove that previous-mode
+// resources belong to this deployment. Pre-deploy inspection and the deploy
+// stage's actual migration must resolve it identically, otherwise ownership
+// validation could reject a migration the inspection already approved.
+func (s *StageManager) migrationSource() string {
+	if s.Payload != nil {
+		if fullName := strings.TrimSpace(s.Payload.FullName); fullName != "" {
+			return fullName
+		}
+	}
+
+	if s.Repository == nil {
+		return ""
+	}
+
+	return s.Repository.SourceUrl
+}
+
+// verifyMirrorReadable fails fast if the bare mirror backing a deployment cannot be
+// opened, so the init stage reports an unreadable mirror instead of letting a later
+// stage fail mid-deployment. The handle it opens is intentionally discarded: go-git
+// caches a handle's packfile index on first use and never refreshes it, so a handle
+// retained past this point would break as soon as another job fetched into the same
+// mirror. Later stages open their own handle per read via StageManager.withMirrorRead.
+func verifyMirrorReadable(mirrorDir string) error {
+	err := gitInternal.WithMirrorRead(mirrorDir, func(*git.Repository) error {
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("failed to open repository mirror: %w", err)
+	}
+
+	return nil
 }

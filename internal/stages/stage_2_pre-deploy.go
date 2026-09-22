@@ -12,14 +12,18 @@ import (
 	"strings"
 	"time"
 
+	gogit "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 
 	secrettypes "github.com/kimdre/doco-cd/internal/secretprovider/types"
 
 	"github.com/kimdre/doco-cd/internal/config"
+	deployConfig "github.com/kimdre/doco-cd/internal/config/deploy"
 	"github.com/kimdre/doco-cd/internal/docker"
 	"github.com/kimdre/doco-cd/internal/filesystem"
 	"github.com/kimdre/doco-cd/internal/git"
+	"github.com/kimdre/doco-cd/internal/prometheus"
+	sourcecache "github.com/kimdre/doco-cd/internal/source/cache"
 )
 
 func shouldSkipDeployment(retryAfterFailure bool,
@@ -39,15 +43,12 @@ func shouldSkipDeployment(retryAfterFailure bool,
 		len(mismatchServices) == 0
 }
 
-func autoDiscoveryConfigLabelDriftServices(deployedStatus map[docker.Service]docker.ServiceStatus, expected string) ([]string, string) {
-	expected = strings.TrimSpace(expected)
-
+func autoDiscoveryConfigLabelDriftServices(deployedStatus map[docker.Service]docker.ServiceStatus, expectedCfg deployConfig.AutoDiscoveryConfig) ([]string, string) {
 	if len(deployedStatus) == 0 {
 		return nil, ""
 	}
 
 	affected := make([]string, 0, len(deployedStatus))
-	expectedCfg := docker.ParseAutoDiscoveryConfig(expected)
 
 	var firstObserved string
 
@@ -55,7 +56,10 @@ func autoDiscoveryConfigLabelDriftServices(deployedStatus map[docker.Service]doc
 		actual, ok := status.Labels[docker.DocoCDLabels.Deployment.AutoDiscoveryConfig]
 
 		actual = strings.TrimSpace(actual)
-		if ok && actual == expected {
+		deployedCfg := docker.ParseAutoDiscoveryConfig(actual)
+
+		// Ignore serialization-only differences (#1818).
+		if ok && docker.AutoDiscoveryConfigsEqual(deployedCfg, expectedCfg) {
 			continue
 		}
 
@@ -63,7 +67,6 @@ func autoDiscoveryConfigLabelDriftServices(deployedStatus map[docker.Service]doc
 		// cleanup reads containers labeled as auto-discovered. With auto-discovery off in
 		// both configs, including the legacy enabled label when the config label is absent,
 		// the config label is inert, so a changed default is no reason to recreate the stack.
-		deployedCfg := docker.ParseAutoDiscoveryConfig(actual)
 		legacyAutoDiscoveryEnabled, _ := strconv.ParseBool(status.Labels[docker.DocoCDLabels.Deployment.AutoDiscovery])
 
 		if !expectedCfg.Enabled && !deployedCfg.Enabled && (ok || !legacyAutoDiscoveryEnabled) {
@@ -78,7 +81,7 @@ func autoDiscoveryConfigLabelDriftServices(deployedStatus map[docker.Service]doc
 	}
 
 	if len(affected) == 0 {
-		return nil, expected
+		return nil, docker.MarshalAutoDiscoveryConfig(expectedCfg)
 	}
 
 	slices.Sort(affected)
@@ -108,6 +111,96 @@ func shouldSkipOCIDeployment(forceRecreate bool, deployedDigest, resolvedDigest,
 // In such cases, we may want to recover by treating it as a full-change deployment.
 func shouldRecoverFromMissingDeployedCommit(err error) bool {
 	return git.IsRefUnreachableError(err)
+}
+
+// isStaleDeployment implements the latest-revision-wins guard: removing the repository-wide lock means
+// two events for the same stack no longer deploy in arrival order.
+// If latestHash (the revision this run resolved to) is itself an ancestor of deployedHash (what is already deployed)
+// a newer deployment already won the race and this run is stale;
+// deploying it would silently revert that newer state. It skips only on a proven ancestor
+// relationship: any lookup or traversal failure (e.g. a shallow mirror missing one of the commits) or
+// an unrelated history (force-push, rebase) must fail open so the caller falls through to its usual change comparison.
+//
+// Ancestry walks in go-git traverse backward from the descendant until the ancestor is found or history
+// is exhausted, so cost is dominated by how many commits must be visited before a match (or none at all).
+// In the overwhelmingly common case (normal forward progress) deployedHash is a recent ancestor of
+// latestHash, so that direction is checked first: it typically resolves within a handful of hops. Only
+// when that check comes back false (diverged history, rollback, or rebase) do we fall back to the
+// expensive reverse check, which must walk deployedHash's entire reachable history to prove non-ancestry.
+//
+// cache deduplicates the walk itself: in a monorepo of many stacks, several stacks are often last
+// deployed at the exact same commit, so their (deployedHash, latestHash) pairs are identical and only
+// need to be walked once per job. cache may be nil, in which case each call computes its own result.
+func isStaleDeployment(
+	repo *gogit.Repository, repository string, latestHash, deployedHash plumbing.Hash,
+	cache *GitAncestryCache, stageLog *slog.Logger,
+) bool {
+	deployedIsAncestor, err := cache.isAncestor(repository, deployedHash, latestHash, func() (bool, error) {
+		return git.IsAncestorCommit(repo, deployedHash, latestHash)
+	})
+	if err != nil {
+		stageLog.Debug("could not determine ancestry between deployed and latest commit, proceeding with deployment",
+			slog.String("deployed_commit", deployedHash.String()),
+			slog.String("latest_commit", latestHash.String()),
+			slog.String("reason", err.Error()),
+		)
+
+		return false
+	}
+
+	if deployedIsAncestor {
+		// Normal forward progress: the deployed commit already precedes latestHash, so latestHash cannot
+		// also be an ancestor of deployedHash (that would require a cycle). Not stale.
+		return false
+	}
+
+	isStale, err := cache.isAncestor(repository, latestHash, deployedHash, func() (bool, error) {
+		return git.IsAncestorCommit(repo, latestHash, deployedHash)
+	})
+	if err != nil {
+		stageLog.Debug("could not determine ancestry between latest and deployed commit, proceeding with deployment",
+			slog.String("deployed_commit", deployedHash.String()),
+			slog.String("latest_commit", latestHash.String()),
+			slog.String("reason", err.Error()),
+		)
+
+		return false
+	}
+
+	if isStale {
+		stageLog.Info("latest revision predates the deployed commit, skipping stale deployment",
+			slog.String("deployed_commit", deployedHash.String()),
+			slog.String("latest_commit", latestHash.String()),
+		)
+	}
+
+	return isStale
+}
+
+// measurePreDeployOperation is a helper function that measures
+// the duration of a pre-deploy operation and logs the outcome.
+func measurePreDeployOperation[T any](
+	stageLog *slog.Logger,
+	operation string,
+	fn func() (T, error),
+) (T, error) {
+	startedAt := time.Now()
+	value, err := fn()
+
+	outcome := "success"
+	if err != nil {
+		outcome = "failure"
+	}
+
+	elapsed := time.Since(startedAt)
+	prometheus.PreDeployOperationDuration.WithLabelValues(operation, outcome).Observe(elapsed.Seconds())
+	stageLog.Debug("completed pre-deploy operation",
+		slog.String("operation", operation),
+		slog.String("outcome", outcome),
+		slog.String("elapsed_time", elapsed.Truncate(time.Millisecond).String()),
+	)
+
+	return value, err
 }
 
 func (s *StageManager) RunPreDeployStage(ctx context.Context, stageLog *slog.Logger) error {
@@ -145,6 +238,11 @@ func (s *StageManager) RunPreDeployStage(ctx context.Context, stageLog *slog.Log
 			return fmt.Errorf("failed to resolve external secrets: %w", err)
 		}
 
+		resolvedSecrets, err = secrettypes.InterpolateResolvedSecrets(resolvedSecrets, s.AppConfig.InterpolateResolvedSecrets)
+		if err != nil {
+			return fmt.Errorf("failed to interpolate resolved secrets: %w", err)
+		}
+
 		if s.DeployConfig.Internal.Environment == nil {
 			s.DeployConfig.Internal.Environment = make(map[string]string)
 		}
@@ -162,26 +260,24 @@ func (s *StageManager) RunPreDeployStage(ctx context.Context, stageLog *slog.Log
 	// Init has resolved the repository/payload identity by this point. Migrate
 	// before any skip detection, otherwise an unchanged source could leave the
 	// previous runtime mode alive indefinitely.
-	source := s.Repository.SourceUrl
-	if s.Payload != nil && strings.TrimSpace(s.Payload.FullName) != "" {
-		source = s.Payload.FullName
-	}
-
-	deploymentModeMigrated, err := docker.MigrateDeploymentMode(
-		ctx,
-		stageLog,
-		s.Docker.Cmd,
-		s.DeployConfig.Context,
-		s.DeployConfig.Name,
-		source,
-		s.Docker.SwarmMode,
-		s.Docker.SwarmAvailable,
-	)
+	s.DeployState.modeMigrationNeeded, err = measurePreDeployOperation(stageLog, "deployment_mode_inspection", func() (bool, error) {
+		return docker.DeploymentModeMigrationRequired(
+			ctx,
+			s.Docker.Cmd,
+			s.DeployConfig.Context,
+			s.DeployConfig.Name,
+			s.migrationSource(),
+			s.Docker.SwarmMode,
+			s.Docker.SwarmAvailable,
+		)
+	})
 	if err != nil {
-		return fmt.Errorf("failed to migrate deployment mode: %w", err)
+		return fmt.Errorf("failed to inspect deployment mode migration: %w", err)
 	}
 
-	deployedState, err := docker.GetLatestDeployStatus(ctx, s.Docker.Cmd.Client(), s.Docker.SwarmMode, s.Repository.Name, s.DeployConfig.Name)
+	deployedState, err := measurePreDeployOperation(stageLog, "deployed_state_lookup", func() (docker.LatestServiceStatus, error) {
+		return docker.GetLatestDeployStatus(ctx, s.Docker.Cmd.Client(), s.Docker.SwarmMode, s.Repository.Name, s.DeployConfig.Name)
+	})
 	if err != nil {
 		return fmt.Errorf("failed to get latest state from deployed services: %w", err)
 	}
@@ -204,18 +300,19 @@ func (s *StageManager) RunPreDeployStage(ctx context.Context, stageLog *slog.Log
 	// project would touch nothing. Force recreate so the retry re-runs it all.
 	retryForceRecreate := retryAfterFailure && lastFailure.Stage == string(StageDeploy)
 
-	expectedAutoDiscoveryLabel := docker.MarshalAutoDiscoveryConfig(s.DeployConfig.AutoDiscovery)
 	autoDiscoveryDriftServices, deployedAutoDiscoveryLabel := autoDiscoveryConfigLabelDriftServices(
 		deployedState.DeployedStatus,
-		expectedAutoDiscoveryLabel,
+		s.DeployConfig.AutoDiscovery,
 	)
 
 	autoDiscoveryConfigChanged := len(autoDiscoveryDriftServices) > 0
 	if autoDiscoveryConfigChanged {
 		stageLog.Debug("auto-discovery config label changed, proceeding with deployment",
 			slog.Any("affected_services", autoDiscoveryDriftServices),
-			slog.String("deployed_auto_discovery_config", deployedAutoDiscoveryLabel),
-			slog.String("expected_auto_discovery_config", expectedAutoDiscoveryLabel),
+			slog.Group("auto_discovery_config",
+				slog.String("deployed", deployedAutoDiscoveryLabel),
+				slog.String("expected", docker.MarshalAutoDiscoveryConfig(s.DeployConfig.AutoDiscovery)),
+			),
 		)
 	}
 
@@ -224,12 +321,14 @@ func (s *StageManager) RunPreDeployStage(ctx context.Context, stageLog *slog.Log
 		resolvedDigest := s.Repository.Revision
 		deployedProjectHash := deployedState.GetDeploymentComposeHash()
 
-		resolvedProjectHash, err := s.loadComposeProjectHash(ctx)
+		resolvedProjectHash, err := measurePreDeployOperation(stageLog, "compose_load_and_hash", func() (string, error) {
+			return s.loadComposeProjectHash(ctx)
+		})
 		if err != nil {
 			return err
 		}
 
-		if !deploymentModeMigrated &&
+		if !s.DeployState.modeMigrationNeeded &&
 			shouldSkipOCIDeployment(s.DeployConfig.ForceRecreate, deployedDigest, resolvedDigest, deployedProjectHash, resolvedProjectHash) &&
 			!autoDiscoveryConfigChanged &&
 			!retryAfterFailure {
@@ -272,9 +371,15 @@ func (s *StageManager) RunPreDeployStage(ctx context.Context, stageLog *slog.Log
 	if deployedCommit := deployedState.GetDeploymentCommitSHA(); deployedCommit != "" {
 		s.DeployState.DeployedCommit = deployedCommit
 
-		latestCommit, err := git.GetLatestCommit(s.Repository.Git, s.DeployConfig.Reference)
-		if err != nil {
-			return fmt.Errorf("failed to get latest commit: %w", err)
+		// The revision stage 1 published for this stack, not whatever the shared mirror points at now:
+		// a parallel run for a newer commit may have advanced the mirror since, and comparing against that would
+		// both defeat the stale-deployment guard below and label this stack with a commit whose content was never deployed.
+		latestCommit := strings.TrimSpace(s.Repository.Revision)
+		if latestCommit == "" {
+			latestCommit, err = s.latestCommitFromMirror()
+			if err != nil {
+				return fmt.Errorf("failed to get latest commit: %w", err)
+			}
 		}
 
 		s.DeployState.latestCommit = latestCommit
@@ -283,7 +388,9 @@ func (s *StageManager) RunPreDeployStage(ctx context.Context, stageLog *slog.Log
 			slog.String("deployed_commit", deployedCommit),
 			slog.String("latest_commit", latestCommit))
 
-		newHash, err := s.loadComposeProjectHash(ctx)
+		newHash, err := measurePreDeployOperation(stageLog, "compose_load_and_hash", func() (string, error) {
+			return s.loadComposeProjectHash(ctx)
+		})
 		if err != nil {
 			return err
 		}
@@ -293,7 +400,9 @@ func (s *StageManager) RunPreDeployStage(ctx context.Context, stageLog *slog.Log
 		} else if s.DeployConfig.ForceImagePull {
 			stageLog.Debug("force image pull enabled, checking deployed image digests against registry")
 
-			imageChangedServices, err = docker.DeployedServicesWithChangedImageDigests(ctx, s.Docker.Cmd, s.Docker.SwarmMode, s.Docker.Project, stageLog)
+			imageChangedServices, err = measurePreDeployOperation(stageLog, "image_digest_lookup", func() ([]string, error) {
+				return docker.DeployedServicesWithChangedImageDigests(ctx, s.Docker.Cmd, s.Docker.SwarmMode, s.Docker.Project, stageLog)
+			})
 			if err != nil {
 				return fmt.Errorf("failed to compare deployed service image digests: %w", err)
 			}
@@ -325,10 +434,37 @@ func (s *StageManager) RunPreDeployStage(ctx context.Context, stageLog *slog.Log
 		)
 
 		if deployedHash != latestHash {
+			// latest-revision-wins: removing the repository-wide lock means two
+			// events for this stack no longer deploy in arrival order.
+			// If the revision this run resolved to is itself an ancestor of what is
+			// already deployed, a newer deployment already won the race and this
+			// run is stale - deploying it would silently revert that newer state.
+			// A failed last attempt makes the deployed-commit label unreliable
+			// (see the comment above), so the check is skipped during that retry.
+			// force_recreate is an explicit instruction to deploy the configured
+			// revision, so it also bypasses the guard: the ancestry alone cannot
+			// distinguish a stale concurrent event from a deliberate rollback to
+			// an older reference, which must stay possible.
 			gitChangedFiles := make([]git.ChangedFile, 0)
 
-			if _, err := s.Repository.Git.CommitObject(deployedHash); err != nil {
-				if shouldRecoverFromMissingDeployedCommit(err) {
+			// One scoped mirror read covers the whole comparison: the ancestry check, the
+			// reachability probe for the deployed commit and the changed-file walk all read
+			// the same mirror state through the same short-lived handle.
+			err = s.withMirrorRead(func(repo *gogit.Repository) error {
+				if !retryAfterFailure && !s.DeployConfig.ForceRecreate {
+					stale, _ := measurePreDeployOperation(stageLog, "git_ancestry", func() (bool, error) {
+						return isStaleDeployment(repo, s.Repository.MirrorDir, latestHash, deployedHash, s.GitAncestry, stageLog), nil
+					})
+					if stale {
+						return ErrSkipDeployment
+					}
+				}
+
+				if _, err := repo.CommitObject(deployedHash); err != nil {
+					if !shouldRecoverFromMissingDeployedCommit(err) {
+						return fmt.Errorf("failed to resolve deployed commit %s: %w", deployedCommit, err)
+					}
+
 					stageLog.Warn("previous deployed commit is no longer reachable; continuing with full-change deployment comparison",
 						slog.String("deployed_commit", deployedCommit),
 						slog.String("latest_commit", latestCommit),
@@ -336,22 +472,43 @@ func (s *StageManager) RunPreDeployStage(ctx context.Context, stageLog *slog.Log
 					)
 
 					composeChanged = true
-				} else {
-					return fmt.Errorf("failed to resolve deployed commit %s: %w", deployedCommit, err)
+
+					return nil
 				}
-			} else {
-				gitChangedFiles, err = git.GetChangedFilesBetweenCommits(s.Repository.Git, deployedHash, latestHash)
+
+				gitChangedFiles, err = measurePreDeployOperation(stageLog, "git_changed_files", func() ([]git.ChangedFile, error) {
+					return s.GitChanges.changedFiles(s.Repository.MirrorDir, deployedHash, latestHash, func() ([]git.ChangedFile, error) {
+						return git.GetChangedFilesBetweenCommits(repo, deployedHash, latestHash)
+					})
+				})
 				if err != nil {
 					return fmt.Errorf("failed to get changed files between commits: %w", err)
 				}
+
+				return nil
+			})
+			if err != nil {
+				return err
 			}
 
 			changedFiles := docker.GetPathsFromGitChangedFiles(gitChangedFiles, s.Repository.PathExternal)
 
-			changedServices, ignoredInfo, err = docker.ProjectFilesHaveChanges(s.Repository.PathExternal, changedFiles, s.Docker.Project)
-			if err != nil {
-				return fmt.Errorf("failed to check for changed project files: %s", err)
+			type projectChanges struct {
+				changed []docker.Change
+				ignored docker.IgnoredInfo
 			}
+
+			mappedChanges, mapErr := measurePreDeployOperation(stageLog, "project_change_mapping", func() (projectChanges, error) {
+				changed, ignored, changeErr := docker.ProjectFilesHaveChanges(s.Repository.PathExternal, changedFiles, s.Docker.Project)
+
+				return projectChanges{changed: changed, ignored: ignored}, changeErr
+			})
+			if mapErr != nil {
+				return fmt.Errorf("failed to check for changed project files: %s", mapErr)
+			}
+
+			changedServices = mappedChanges.changed
+			ignoredInfo = mappedChanges.ignored
 		}
 
 		if autoDiscoveryConfigChanged {
@@ -370,12 +527,13 @@ func (s *StageManager) RunPreDeployStage(ctx context.Context, stageLog *slog.Log
 		}
 
 		mismatchServices := docker.CheckServiceMismatch(s.Docker.SwarmMode, deployedState.DeployedStatus, s.Docker.Project.Services)
+		mismatchServices = s.dropSchedulerHeldMismatches(mismatchServices, stageLog)
 
 		if s.DeployConfig.ForceRecreate {
 			stageLog.Debug("force recreate enabled, proceeding with deployment",
 				slog.String("directory", s.DeployConfig.WorkingDirectory),
 			)
-		} else if !deploymentModeMigrated &&
+		} else if !s.DeployState.modeMigrationNeeded &&
 			shouldSkipDeployment(retryAfterFailure, composeChanged, autoDiscoveryConfigChanged, changedServices, ignoredInfo, imagesChanged, mismatchServices) {
 			stageLog.Debug("no changes detected, skipping deployment",
 				slog.String("directory", s.DeployConfig.WorkingDirectory),
@@ -390,7 +548,9 @@ func (s *StageManager) RunPreDeployStage(ctx context.Context, stageLog *slog.Log
 		// only enriches the notification and must never change the outcome: an error is
 		// logged and dropped rather than failing a deployment that is going ahead.
 		if len(imageChangedServices) == 0 {
-			refChangedServices, err := docker.DeployedServicesWithChangedImageRefs(ctx, s.Docker.Cmd, s.Docker.SwarmMode, s.Docker.Project, stageLog)
+			refChangedServices, err := measurePreDeployOperation(stageLog, "image_reference_lookup", func() ([]string, error) {
+				return docker.DeployedServicesWithChangedImageRefs(ctx, s.Docker.Cmd, s.Docker.SwarmMode, s.Docker.Project, stageLog)
+			})
 			if err != nil {
 				stageLog.Warn("failed to compare deployed image references", slog.String("err", err.Error()))
 			} else {
@@ -419,6 +579,57 @@ func (s *StageManager) RunPreDeployStage(ctx context.Context, stageLog *slog.Log
 	return nil
 }
 
+// dropSchedulerHeldMismatches removes service mismatches that doco-cd caused
+// itself: a scheduled job with cd.doco.job.stop_services stops its targets
+// before the job runs and starts them again afterwards. A poll tick landing
+// inside that window sees zero running replicas, reports drift and deploys a
+// stack that is already about to come back, which costs a full deploy cycle and
+// a "Deployment completed" notification for nothing.
+//
+// Same suppression the reconciliation event listener already does, and with the
+// same scope: holds are registered for Compose-mode jobs only, so Swarm
+// deployments are left alone.
+func (s *StageManager) dropSchedulerHeldMismatches(mismatches []docker.ServiceMismatch, stageLog *slog.Logger) []docker.ServiceMismatch {
+	if len(mismatches) == 0 || s.SchedulerHolds == nil {
+		return mismatches
+	}
+
+	if s.Docker == nil || s.Docker.SwarmMode || s.Docker.Project == nil || s.Docker.Project.Name == "" {
+		return mismatches
+	}
+
+	contextName := ""
+	if s.DeployConfig != nil {
+		contextName = s.DeployConfig.Context
+	}
+
+	kept := make([]docker.ServiceMismatch, 0, len(mismatches))
+
+	var held []string
+
+	for _, mismatch := range mismatches {
+		if s.SchedulerHolds.IsSchedulerStopHeld(contextName, s.Docker.Project.Name, mismatch.ServiceName) {
+			held = append(held, mismatch.ServiceName)
+			continue
+		}
+
+		kept = append(kept, mismatch)
+	}
+
+	if len(held) > 0 && stageLog != nil {
+		stageLog.Debug("ignoring service mismatch for services intentionally held stopped by job scheduler",
+			slog.String("project", s.Docker.Project.Name),
+			slog.Any("services", held),
+		)
+	}
+
+	if len(kept) == 0 {
+		return nil
+	}
+
+	return kept
+}
+
 func (s *StageManager) loadComposeProjectHash(ctx context.Context) (string, error) {
 	if strings.Contains(s.DeployConfig.WorkingDirectory, "..") {
 		return "", errors.New("invalid working directory: must not contain '..' to prevent directory traversal")
@@ -439,10 +650,13 @@ func (s *StageManager) loadComposeProjectHash(ctx context.Context) (string, erro
 		return "", fmt.Errorf("failed to check for default compose files: %w", err)
 	}
 
+	composeOpts := docker.NewComposeLoadOptions(s.AppConfig)
+	composeOpts.MutationLock = sourcecache.NewPathLocker(s.sourceLockKey())
+
 	s.Docker.Project, err = docker.LoadCompose(
 		ctx, s.Docker.Cmd, s.Repository.PathExternal, extAbsWorkingDir, s.DeployConfig.Name,
 		s.DeployConfig.ComposeFiles, s.DeployConfig.EnvFiles,
-		s.DeployConfig.Profiles, s.DeployConfig.Internal.Environment, docker.NewComposeLoadOptions(s.AppConfig))
+		s.DeployConfig.Profiles, s.DeployConfig.Internal.Environment, composeOpts)
 	if err != nil {
 		return "", fmt.Errorf("failed to load compose project: %w", err)
 	}
@@ -452,7 +666,7 @@ func (s *StageManager) loadComposeProjectHash(ctx context.Context) (string, erro
 	// solely because an unchanged role issued a fresh certificate.
 	hashProject := docker.WithNormalizedEnvValues(s.Docker.Project, pkiRoleNormMap(s.DeployConfig.ExternalSecrets, s.DeployConfig.Internal.Environment))
 
-	projectHash, err := docker.ProjectHash(hashProject)
+	projectHash, err := docker.ProjectHash(hashProject, s.Repository.PathExternal)
 	if err != nil {
 		return "", fmt.Errorf("failed to get project hash: %w", err)
 	}

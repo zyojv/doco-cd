@@ -118,6 +118,33 @@ func TestMigrateDeploymentMode_SkipsMigrationWhenSwarmUnavailable(t *testing.T) 
 	}
 }
 
+func TestDeploymentModeMigrationRequiredDoesNotMutate(t *testing.T) {
+	t.Parallel()
+
+	apiClient := &deploymentModeMigrationClient{
+		containers: []containerTypes.Summary{{
+			Names:  []string{"/example_web_1"},
+			Labels: migrationTestOwnershipLabels(),
+		}},
+	}
+	dockerCli := deploymentModeMigrationCLI{apiClient: apiClient}
+
+	required, err := DeploymentModeMigrationRequired(
+		t.Context(), dockerCli, "", "example", "owner/repo", true, true,
+	)
+	if err != nil {
+		t.Fatalf("DeploymentModeMigrationRequired() error = %v", err)
+	}
+
+	if !required {
+		t.Fatal("DeploymentModeMigrationRequired() = false, want true")
+	}
+
+	if apiClient.containerListCalls != 1 || apiClient.serviceListCalls != 1 {
+		t.Fatalf("unexpected inspection API calls: ContainerList=%d ServiceList=%d", apiClient.containerListCalls, apiClient.serviceListCalls)
+	}
+}
+
 func TestMigrationSourceMatches(t *testing.T) {
 	t.Parallel()
 
@@ -162,6 +189,19 @@ func TestMigrationSourceMatches(t *testing.T) {
 			expectedSource: "owner/repo",
 			labels:         Labels{DocoCDLabels.Source.Name: "someone-else/repo"},
 			want:           false,
+		},
+		// Regression test for https://github.com/kimdre/doco-cd/issues/1850: the
+		// resolved source used for matching (Source.URL) may be an SSH clone URL
+		// even though the webhook/poll payload's browsable URL used transiently
+		// for commit statuses is HTTP(S). Ownership matching must succeed against
+		// the actually-resolved source recorded in the label.
+		{
+			name:           "matches ssh clone url recorded in source url label",
+			expectedSource: "ssh://git@gits.example.com:222/owner/repo.git",
+			labels: Labels{
+				DocoCDLabels.Source.URL: "ssh://git@gits.example.com:222/owner/repo.git",
+			},
+			want: true,
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

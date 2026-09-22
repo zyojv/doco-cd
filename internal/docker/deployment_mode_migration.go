@@ -11,6 +11,7 @@ import (
 	"github.com/docker/compose/v5/pkg/api"
 	"github.com/moby/moby/client"
 
+	"github.com/kimdre/doco-cd/internal/common/types/set"
 	"github.com/kimdre/doco-cd/internal/config/app"
 	deployConfig "github.com/kimdre/doco-cd/internal/config/deploy"
 	"github.com/kimdre/doco-cd/internal/git"
@@ -42,33 +43,16 @@ func MigrateDeploymentMode(ctx context.Context, log *slog.Logger, dockerCli comm
 	lock.LockStack(stackLockKey)
 	defer lock.UnlockStack(stackLockKey)
 
-	previousMode := !swarmMode
-
-	labelsByService, err := deploymentModeLabels(ctx, dockerCli.Client(), stackName, previousMode)
+	required, err := deploymentModeMigrationRequired(ctx, dockerCli.Client(), stackName, source, swarmMode)
 	if err != nil {
-		return false, fmt.Errorf("failed to inspect %s resources for deployment mode migration: %w", deploymentModeName(previousMode), err)
+		return false, err
 	}
 
-	if len(labelsByService) == 0 {
+	if !required {
 		return false, nil
 	}
 
-	expectedSources := migrationSourceCandidates(source)
-	if err = validateMigrationOwnership(labelsByService, expectedSources, previousMode, stackName); err != nil {
-		return false, err
-	}
-
-	// A partial earlier migration may have resources in both modes. Do not
-	// remove the verified old mode if the selected mode is occupied by an
-	// unmanaged same-named deployment.
-	selectedLabels, err := deploymentModeLabels(ctx, dockerCli.Client(), stackName, swarmMode)
-	if err != nil {
-		return false, fmt.Errorf("failed to inspect %s resources for deployment mode migration: %w", deploymentModeName(swarmMode), err)
-	}
-
-	if err := validateMigrationOwnership(selectedLabels, expectedSources, swarmMode, stackName); err != nil {
-		return false, err
-	}
+	previousMode := !swarmMode
 
 	if log == nil {
 		log = slog.Default()
@@ -88,6 +72,57 @@ func MigrateDeploymentMode(ctx context.Context, log *slog.Logger, dockerCli comm
 
 	if err := DestroyStack(log, &ctx, &dockerCli, removeConfig, previousMode); err != nil {
 		return false, fmt.Errorf("failed to remove previous %s deployment: %w", deploymentModeName(previousMode), err)
+	}
+
+	return true, nil
+}
+
+// DeploymentModeMigrationRequired checks whether the previous runtime mode
+// must be removed without mutating Docker state.
+func DeploymentModeMigrationRequired(ctx context.Context, dockerCli command.Cli, contextName, stackName, source string, swarmMode, swarmAvailable bool) (bool, error) {
+	if dockerCli == nil {
+		return false, errors.New("docker cli is required")
+	}
+
+	if !swarmAvailable {
+		return false, nil
+	}
+
+	stackLockKey := lock.StackKey(contextName, stackName)
+
+	lock.LockStack(stackLockKey)
+	defer lock.UnlockStack(stackLockKey)
+
+	return deploymentModeMigrationRequired(ctx, dockerCli.Client(), stackName, source, swarmMode)
+}
+
+func deploymentModeMigrationRequired(ctx context.Context, dockerClient client.APIClient, stackName, source string, swarmMode bool) (bool, error) {
+	previousMode := !swarmMode
+
+	labelsByService, err := deploymentModeLabels(ctx, dockerClient, stackName, previousMode)
+	if err != nil {
+		return false, fmt.Errorf("failed to inspect %s resources for deployment mode migration: %w", deploymentModeName(previousMode), err)
+	}
+
+	if len(labelsByService) == 0 {
+		return false, nil
+	}
+
+	expectedSources := migrationSourceCandidates(source)
+	if err = validateMigrationOwnership(labelsByService, expectedSources, previousMode, stackName); err != nil {
+		return false, err
+	}
+
+	// A partial earlier migration may have resources in both modes. Do not
+	// remove the verified old mode if the selected mode is occupied by an
+	// unmanaged same-named deployment.
+	selectedLabels, err := deploymentModeLabels(ctx, dockerClient, stackName, swarmMode)
+	if err != nil {
+		return false, fmt.Errorf("failed to inspect %s resources for deployment mode migration: %w", deploymentModeName(swarmMode), err)
+	}
+
+	if err := validateMigrationOwnership(selectedLabels, expectedSources, swarmMode, stackName); err != nil {
+		return false, err
 	}
 
 	return true, nil
@@ -118,7 +153,7 @@ func deploymentModeLabels(ctx context.Context, dockerClient client.APIClient, st
 }
 
 // validateMigrationOwnership checks that all discovered resources are owned by this deployment source.
-func validateMigrationOwnership(labelsByService map[Service]Labels, expectedSources map[string]struct{}, mode bool, stackName string) error {
+func validateMigrationOwnership(labelsByService map[Service]Labels, expectedSources set.Set[string], mode bool, stackName string) error {
 	for service, labels := range labelsByService {
 		if labels[DocoCDLabels.Metadata.Manager] != app.Name ||
 			!migrationSourceMatches(labels, expectedSources) {
@@ -131,13 +166,13 @@ func validateMigrationOwnership(labelsByService map[Service]Labels, expectedSour
 }
 
 // migrationSourceMatches returns true if any of the source labels match the expected sources.
-func migrationSourceMatches(labels Labels, expectedSources map[string]struct{}) bool {
+func migrationSourceMatches(labels Labels, expectedSources set.Set[string]) bool {
 	for _, source := range []string{
 		labels[DocoCDLabels.Source.Name],
 		labels[DocoCDLabels.Source.URL],
 	} {
 		for candidate := range migrationSourceCandidates(source) {
-			if _, ok := expectedSources[candidate]; ok {
+			if expectedSources.Contains(candidate) {
 				return true
 			}
 		}
@@ -147,17 +182,15 @@ func migrationSourceMatches(labels Labels, expectedSources map[string]struct{}) 
 }
 
 // migrationSourceCandidates returns a set of normalized source candidates for matching against existing resources.
-func migrationSourceCandidates(source string) map[string]struct{} {
+func migrationSourceCandidates(source string) set.Set[string] {
 	normalized := normalizeRepositoryForLabelMatch(source)
-	candidates := map[string]struct{}{
-		normalized: {},
-	}
+	candidates := set.New(normalized)
 
 	source = strings.TrimSpace(source)
 	if strings.Contains(source, "://") ||
 		(strings.Contains(source, "@") && strings.Contains(source, ":")) ||
 		hasRepositoryHostPrefix(normalized) {
-		candidates[normalizeRepositoryForLabelMatch(git.GetFullName(normalized))] = struct{}{}
+		candidates.Add(normalizeRepositoryForLabelMatch(git.GetFullName(normalized)))
 	}
 
 	return candidates

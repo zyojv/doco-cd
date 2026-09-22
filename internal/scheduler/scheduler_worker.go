@@ -10,6 +10,7 @@ import (
 	"github.com/moby/moby/client"
 
 	"github.com/kimdre/doco-cd/internal/common/id"
+	"github.com/kimdre/doco-cd/internal/common/types/set"
 	"github.com/kimdre/doco-cd/internal/docker"
 	"github.com/kimdre/doco-cd/internal/graceful"
 	"github.com/kimdre/doco-cd/internal/logger"
@@ -19,6 +20,7 @@ import (
 const (
 	schedulerEventReconnectDelay = time.Second
 	schedulerRefreshRetryDelay   = time.Second
+	schedulerRecoverySweepDelay  = time.Minute
 )
 
 func (s *scheduler) run(ctx context.Context) {
@@ -26,11 +28,15 @@ func (s *scheduler) run(ctx context.Context) {
 
 	jobChanges := s.watchJobChanges(ctx)
 	timer := time.NewTimer(time.Hour)
+	recoveryTicker := time.NewTicker(schedulerRecoverySweepDelay)
 
 	stopTimer(timer)
 	defer timer.Stop()
+	defer recoveryTicker.Stop()
 
 	s.log.Info("starting scheduler")
+
+	s.recoverExecutions(ctx)
 
 	nextRun, hasNextRun := s.refreshJobs(ctx, schedulerNow())
 
@@ -50,6 +56,8 @@ func (s *scheduler) run(ctx context.Context) {
 			nextRun, hasNextRun = s.refreshJobs(ctx, schedulerNow())
 		case t := <-timer.C:
 			nextRun, hasNextRun = s.refreshJobs(ctx, t)
+		case <-recoveryTicker.C:
+			s.recoverExecutions(ctx)
 		}
 	}
 }
@@ -65,7 +73,7 @@ func (s *scheduler) refreshJobs(ctx context.Context, now time.Time) (time.Time, 
 		return now.Add(schedulerRefreshRetryDelay), true
 	}
 
-	active := make(map[string]struct{}, len(jobs))
+	active := set.New[string]()
 	discoveredByKey := make(map[string]scheduledJob, len(jobs))
 
 	var nearestNextRun time.Time
@@ -88,7 +96,7 @@ func (s *scheduler) refreshJobs(ctx context.Context, now time.Time) (time.Time, 
 			continue
 		}
 
-		active[job.key] = struct{}{}
+		active.Add(job.key)
 
 		fingerprint := getScheduleFingerprint(cfg)
 
@@ -148,7 +156,7 @@ func (s *scheduler) refreshJobs(ctx context.Context, now time.Time) (time.Time, 
 	}
 
 	for key := range s.states {
-		if _, exists := active[key]; !exists {
+		if !active.Contains(key) {
 			if job, ok := discoveredByKey[key]; ok {
 				s.log.Info("job unscheduled",
 					slog.String("job", job.name),
@@ -248,7 +256,7 @@ func (s *scheduler) triggerRun(ctx context.Context, job scheduledJob, cfg docker
 	stackName := getJobStackName(job)
 	metricLabels := getScheduledRunMetricLabels(job, cfg, stackName)
 
-	if cfg.SkipRunning && s.isRunInProgress(job.key) {
+	if cfg.SkipRunning && (job.running || s.isRunInProgress(job.key)) {
 		s.log.Warn("skipping scheduled run because previous run is still in progress",
 			slog.String("job", job.name),
 			slog.String("stack", stackName),
@@ -307,7 +315,38 @@ func (s *scheduler) triggerRun(ctx context.Context, job scheduledJob, cfg docker
 
 		runLog.Debug("triggering scheduled run")
 
-		err := s.executeScheduledRun(ctx, job, cfg)
+		var record *executionRecord
+
+		if cfg.ExecutionMode == docker.JobExecutionModeOneOff {
+			if !s.claimRecovery(runID) {
+				runFailed = true
+
+				runLog.Error("scheduled run ID is already active")
+
+				return
+			}
+
+			defer s.releaseRecovery(runID)
+
+			newRecord := s.newExecutionRecord(runID, job, cfg)
+			if err := s.executions.create(&newRecord); err != nil {
+				runFailed = true
+				err = fmt.Errorf("persist scheduled execution before launch: %w", err)
+				s.runtime.updateRunStatus(job, cfg, err)
+				runLog.Error("scheduled run failed", logger.ErrAttr(err))
+				s.sendRunNotification(job, cfg, runID, false, "Scheduled job failed", fmt.Sprintf("scheduled job '%s' failed to run: %v", job.name, err))
+
+				return
+			}
+
+			record = &newRecord
+		}
+
+		err := s.executeScheduledRun(ctx, job, cfg, record, now, runStart)
+		if ctx.Err() != nil {
+			return
+		}
+
 		s.runtime.updateRunStatus(job, cfg, err)
 
 		if err != nil {
@@ -316,11 +355,15 @@ func (s *scheduler) triggerRun(ctx context.Context, job scheduledJob, cfg docker
 			runLog.Error("scheduled run failed", logger.ErrAttr(err))
 			s.sendRunNotification(job, cfg, runID, false, "Scheduled job failed", fmt.Sprintf("scheduled job '%s' failed to run: %v", job.name, err))
 
+			s.completeExecutionRecord(ctx, record)
+
 			return
 		}
 
 		runLog.Info("scheduled run completed", slog.String("next_run", s.states[job.key].nextRun.Format(time.RFC3339)))
 		s.sendRunNotification(job, cfg, runID, true, "Scheduled job completed", fmt.Sprintf("scheduled job '%s' completed successfully", job.name))
+
+		s.completeExecutionRecord(ctx, record)
 	})
 }
 

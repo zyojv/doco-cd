@@ -14,13 +14,14 @@ import (
 	"github.com/kimdre/doco-cd/internal/common/id"
 
 	"github.com/kimdre/doco-cd/internal/commitstatus"
+	"github.com/kimdre/doco-cd/internal/common/types/set"
 	"github.com/kimdre/doco-cd/internal/config"
 	"github.com/kimdre/doco-cd/internal/config/app"
+	"github.com/kimdre/doco-cd/internal/config/deploy"
 	"github.com/kimdre/doco-cd/internal/config/poll"
 	"github.com/kimdre/doco-cd/internal/controlplane"
 	"github.com/kimdre/doco-cd/internal/docker"
 
-	"github.com/kimdre/doco-cd/internal/lock"
 	"github.com/kimdre/doco-cd/internal/notification"
 	restAPI "github.com/kimdre/doco-cd/internal/restapi"
 	"github.com/kimdre/doco-cd/internal/secretprovider"
@@ -223,6 +224,85 @@ func shouldUsePayloadSSHURL(overrideApplied bool, payloadSSHURL string, resolved
 	}
 
 	return strings.TrimSpace(payloadSSHURL) != "" && resolved.SSHPrivateKey != ""
+}
+
+// matchingInlineWebhookDeployments returns inline deployments whose poll source, reference, and target match the webhook.
+func matchingInlineWebhookDeployments(
+	appConfig *app.Config,
+	payload webhook.ParsedPayload,
+	sourceRef string,
+	customTarget string,
+) []*deploy.Config {
+	if appConfig == nil {
+		return nil
+	}
+
+	webhookIdentities := gitSourceIdentities(payload.CloneURL, sourceRef)
+	if len(webhookIdentities) == 0 {
+		return nil
+	}
+
+	customTarget = strings.TrimSpace(customTarget)
+
+	var deployments []*deploy.Config
+
+	for i := range appConfig.PollConfig {
+		pollConfig := &appConfig.PollConfig[i]
+		if config.NormalizeSourceType(pollConfig.Source) != config.SourceTypeGit ||
+			len(pollConfig.Deployments) == 0 ||
+			strings.TrimSpace(pollConfig.CustomTarget) != customTarget ||
+			!referencesMatch(pollConfig.Reference, payload.Ref) {
+			continue
+		}
+
+		rewrittenSource, _ := rewriteSourceURL(pollConfig.SourceUrl, appConfig.SourceURLRewrites)
+		if !identitySetsOverlap(webhookIdentities, gitSourceIdentities(pollConfig.SourceUrl, rewrittenSource)) {
+			continue
+		}
+
+		deployments = append(deployments, pollConfig.Deployments...)
+	}
+
+	return deployments
+}
+
+// gitSourceIdentities returns stable repository identities for Git source URLs.
+func gitSourceIdentities(sourceURLs ...string) set.Set[string] {
+	identities := set.New[string]()
+
+	for _, sourceURL := range sourceURLs {
+		if identity := git.GetRepoName(config.NormalizeGitURL(sourceURL)); identity != "" && identity != "." {
+			identities.Add(identity)
+		}
+	}
+
+	return identities
+}
+
+// identitySetsOverlap reports whether two repository identity sets intersect.
+func identitySetsOverlap(left, right set.Set[string]) bool {
+	return left.Intersects(right)
+}
+
+// referencesMatch reports whether configured and webhook references identify the same branch or tag.
+func referencesMatch(configured, webhookRef string) bool {
+	return canonicalWebhookReference(configured) == canonicalWebhookReference(webhookRef)
+}
+
+// canonicalWebhookReference normalizes a ref while retaining its branch, tag, or other-ref type.
+func canonicalWebhookReference(reference string) string {
+	reference = strings.TrimSpace(reference)
+
+	switch {
+	case strings.HasPrefix(reference, git.BranchPrefix):
+		return "branch:" + strings.TrimPrefix(reference, git.BranchPrefix)
+	case strings.HasPrefix(reference, git.TagPrefix):
+		return "tag:" + strings.TrimPrefix(reference, git.TagPrefix)
+	case strings.HasPrefix(reference, "refs/"):
+		return "ref:" + reference
+	default:
+		return "branch:" + reference
+	}
 }
 
 // repositoryNameFromWebhookPayload extracts the repository name from the webhook payload,
@@ -434,6 +514,7 @@ func handleEvent(ctx context.Context, jobLog *slog.Logger, w http.ResponseWriter
 		CustomTarget: customTarget,
 		TestName:     testName,
 		PollConfig:   poll.Config{},
+		Deployments:  matchingInlineWebhookDeployments(appConfig, payload, sourceRef, customTarget),
 		Payload:      payload,
 	})
 	if errors.Is(deployErr, stages.ErrSkipDeployment) {
@@ -604,26 +685,11 @@ func (h *orchestrationHandler) WebhookHandler(w http.ResponseWriter, r *http.Req
 		Revision:   metadata.Revision,
 	})
 
-	lockEntity := "repository"
-	lockLogValue := metadata.Repository
-
-	if payload.Source == webhook.PayloadSourceOCI {
-		lockEntity = "artifact"
-		lockLogValue = payload.Artifact
-	}
-
-	// Prevent concurrent deployments for the same repository using a lock
-	repoLock := lock.GetRepoLock(metadata.Repository)
-
+	// No repository-wide lock is taken here:
+	// source preparation is keyed per-revision (internal/source.Prepare/MarkInFlight) and the actual deployment is
+	// keyed per-stack (internal/lock.LockStack, applied deep in internal/docker.Deploy), so unrelated stacks/revisions
+	// within the same repository run concurrently while conflicting ones still serialize at the layer that actually needs it.
 	handleFn := func(ctx context.Context, w http.ResponseWriter) (controlplane.RunResult, error) {
-		if !acquireWebhookRepoLock(ctx, repoLock, jobID, func() {
-			jobLog.Info("waiting for webhook "+lockEntity+" lock", slog.String(lockEntity, lockLogValue))
-		}) {
-			return controlplane.FailedRun(ctx.Err().Error()), ctx.Err()
-		}
-
-		defer repoLock.Unlock()
-
 		return handleEvent(ctx, jobLog, w, h.appConfig, payload, customTarget, metadata, h.testName, h.deployment, h.notifier)
 	}
 
@@ -661,13 +727,6 @@ func (h *orchestrationHandler) WebhookHandler(w http.ResponseWriter, r *http.Req
 	if !wait {
 		restAPI.JSONResponse(w, "job accepted", jobID, http.StatusAccepted)
 	}
-}
-
-func acquireWebhookRepoLock(ctx context.Context, repoLock *lock.RepoLock, jobID string, onWait func()) bool {
-	waitTimer := time.AfterFunc(10*time.Millisecond, onWait)
-	defer waitTimer.Stop()
-
-	return repoLock.LockContext(ctx, jobID)
 }
 
 // noopResponseWriter is used when we run HandleEvent asynchronously.

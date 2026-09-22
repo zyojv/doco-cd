@@ -282,12 +282,7 @@ func TestDeployCompose(t *testing.T) {
 
 	tmpDir := t.TempDir()
 
-	repo, err := git.CloneOrUpdateRepository(slog.Default(), p.CloneURL, p.Ref, tmpDir, tmpDir,
-		p.Private, c.SSHPrivateKey, c.SSHPrivateKeyPassphrase, c.GitAccessToken, c.SkipTLSVerification,
-		c.HttpProxy, c.GitCloneSubmodules, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	repo := cloneTestRepoBranch(t, tmpDir, p.CloneURL, p.Ref, p.Private, c)
 
 	latestCommit, err := git.GetLatestCommit(repo, p.Ref)
 	if err != nil {
@@ -332,7 +327,7 @@ compose_files:
 		t.Fatal(err)
 	}
 
-	deployConfigs, err := deploy.GetConfigs(tmpDir, c.DeployConfigBaseDir, customTarget, p.Ref, nil)
+	deployConfigs, err := deploy.GetConfigs(context.Background(), tmpDir, c.DeployConfigBaseDir, customTarget, p.Ref, "", "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -518,7 +513,7 @@ compose_files:
 			t.Fatalf("failed to load expected project: %v", err)
 		}
 
-		projectHash, err := ProjectHash(expectedProject)
+		projectHash, err := ProjectHash(expectedProject, repoPath)
 		if err != nil {
 			t.Fatalf("ProjectHash err: %v", err)
 		}
@@ -1619,19 +1614,13 @@ func TestProjectFilesHaveChanges(t *testing.T) {
 
 	tmpDir := t.TempDir()
 
-	repo, err := git.CloneRepository(tmpDir, cloneUrlTest, git.MainBranch, c.SkipTLSVerification, c.HttpProxy, auth, c.GitCloneSubmodules, 0)
-	if err != nil {
-		t.Fatalf("Failed to clone repository: %v", err)
-	}
+	repo := cloneTestRepoAllBranches(t, tmpDir, cloneUrlTest, auth, c)
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			err = git.CheckoutRepository(repo, tc.newCommit, auth, c.GitCloneSubmodules)
-			if err != nil {
-				t.Fatalf("Failed to checkout old commit: %v", err)
-			}
+			checkoutTestCommit(t, repo, tc.newCommit)
 
-			deployConfigs, err := deploy.GetConfigs(tmpDir, ".", "", "", nil)
+			deployConfigs, err := deploy.GetConfigs(context.Background(), tmpDir, ".", "", "", "", "", nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -2203,7 +2192,7 @@ func TestStopAndStartProjectServices(t *testing.T) {
 		}
 	}
 
-	if err = StopProjectServices(ctx, dockerCli, stackName, []string{"db"}, timeout); err != nil {
+	if err = StopProjectServices(ctx, dockerCli, stackName, []string{"db"}, &timeout); err != nil {
 		t.Fatalf("failed to stop project service: %v", err)
 	}
 
@@ -2216,6 +2205,74 @@ func TestStopAndStartProjectServices(t *testing.T) {
 
 	assertServiceState("db", "running")
 	assertServiceState("app", "running")
+}
+
+// TestStopProjectServices_HonoursContainerStopTimeout verifies that when no
+// explicit timeout override is passed to StopProjectServices, a container
+// that declares its own stop timeout (via the compose file's
+// stop_grace_period) is detected as such, so the stop request leaves the
+// timeout unset for it, letting the Docker engine apply the container's own
+// value instead of the doco-cd default (see #1852).
+func TestStopProjectServices_HonoursContainerStopTimeout(t *testing.T) {
+	ctx := context.Background()
+
+	const composeYAML = `services:
+  withgrace:
+    image: nginx:latest
+    stop_grace_period: 5s
+  withoutgrace:
+    image: nginx:latest
+`
+
+	stack := test.ComposeUp(ctx, t, test.WithYAML(composeYAML))
+
+	c, err := app.GetConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dockerCli, err := CreateDockerCli(c.DockerQuietDeploy)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	containers, err := GetProjectContainers(ctx, dockerCli, stack.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(containers) != 2 {
+		t.Fatalf("expected 2 containers, got %d", len(containers))
+	}
+
+	for _, cont := range containers {
+		svcName := cont.Labels[api.ServiceLabel]
+
+		hasTimeout, err := containerHasConfiguredStopTimeout(ctx, dockerCli, cont.ID)
+		if err != nil {
+			t.Fatalf("containerHasConfiguredStopTimeout(%q): %v", svcName, err)
+		}
+
+		switch svcName {
+		case "withgrace":
+			if !hasTimeout {
+				t.Fatalf("expected service %q (stop_grace_period: 5s) to have a configured stop timeout", svcName)
+			}
+		case "withoutgrace":
+			if hasTimeout {
+				t.Fatalf("expected service %q (no stop_grace_period) to have no configured stop timeout", svcName)
+			}
+		default:
+			t.Fatalf("unexpected service %q", svcName)
+		}
+	}
+
+	// StopProjectServices with no override must still succeed end-to-end for
+	// both containers (one relying on its own configured timeout, one on the
+	// default fallback).
+	if err = StopProjectServices(ctx, dockerCli, stack.Name, []string{"withgrace", "withoutgrace"}, nil); err != nil {
+		t.Fatalf("failed to stop project services: %v", err)
+	}
 }
 
 func TestStopAndStartProjectServices_SchedulerSequence_WithDependsOn(t *testing.T) {
@@ -2286,7 +2343,7 @@ func TestStopAndStartProjectServices_SchedulerSequence_WithDependsOn(t *testing.
 	t.Log("Stopping db service to simulate scheduler pre-run hook")
 
 	// 1) Scheduler pre-run hook: stop selected services (db).
-	if err = StopProjectServices(ctx, dockerCli, stackName, []string{"db"}, timeout); err != nil {
+	if err = StopProjectServices(ctx, dockerCli, stackName, []string{"db"}, &timeout); err != nil {
 		t.Fatalf("failed to stop project service: %v", err)
 	}
 
@@ -2704,6 +2761,47 @@ func TestDecryptProjectFiles(t *testing.T) {
 				}
 			},
 			expectedDecryptedFileBasenames: []string{},
+		},
+		{
+			name: "bind-mounted directory without encrypted files does not discard earlier results",
+			buildProject: func(t *testing.T, tmpDir string) *types.Project {
+				t.Helper()
+
+				secretsDir := filepath.Join(tmpDir, "secrets")
+				if err := os.Mkdir(secretsDir, filesystem.PermDir); err != nil {
+					t.Fatalf("failed to create %s: %v", secretsDir, err)
+				}
+
+				envFile := filepath.Join(secretsDir, "app.env")
+				copyFile(t, encryptedEnvSrc, envFile)
+
+				staticDir := filepath.Join(tmpDir, "static")
+				if err := os.Mkdir(staticDir, filesystem.PermDir); err != nil {
+					t.Fatalf("failed to create %s: %v", staticDir, err)
+				}
+
+				// #nosec G703 -- path is constructed from t.TempDir(), not user input
+				if err := os.WriteFile(filepath.Join(staticDir, "index.html"), []byte("<html></html>"), filesystem.PermOwner); err != nil {
+					t.Fatalf("failed to write plain file: %v", err)
+				}
+
+				return &types.Project{
+					WorkingDir: tmpDir,
+					Services: types.Services{
+						"svc1": {
+							Name:     "svc1",
+							EnvFiles: []types.EnvFile{{Path: envFile}},
+							// The directory with the encrypted file is walked first, the
+							// directory without encrypted files second.
+							Volumes: []types.ServiceVolumeConfig{
+								{Type: "bind", Source: secretsDir, Target: "/run/secrets"},
+								{Type: "bind", Source: staticDir, Target: "/srv"},
+							},
+						},
+					},
+				}
+			},
+			expectedDecryptedFileBasenames: []string{"app.env"},
 		},
 	}
 

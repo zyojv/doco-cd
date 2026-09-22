@@ -13,6 +13,7 @@ bin/
 *.dll
 *.so
 *.dylib
+doco-cd
 
 # Test binary, built with `go test -c`
 *.test
@@ -49,3 +50,7 @@ git-auth-domains.yaml
 issue.md
 .github/AGENTS.md
 .github/mcp.json
+
+# Python cache
+__pycache__/
+*.pyc

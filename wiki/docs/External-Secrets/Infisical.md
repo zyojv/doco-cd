@@ -28,7 +28,7 @@ A valid secret reference should use the syntax:
 
 !!! warning
     Machine accounts can only access projects for which you have granted read permissions.
-    When using [Infisical secret references](https://infisical.com/docs/documentation/platform/secret-reference),
+    When using [Infisical secret references][infisical-secret-reference-docs],
     the machine identity also needs read access to every referenced secret and its environment and folder.
 
 ### Example
@@ -45,9 +45,8 @@ external_secrets:
 
 ## Infisical secret references
 
-You can reference other Infisical secrets, including imported secrets, in a
-secret's value. Define expressions such as `${DB_HOST}` in the value stored in
-Infisical, not in the `external_secrets` locator.
+You can reference other Infisical secrets, including imported secrets, in a secret's value, see their [documentation][infisical-secret-reference-docs].
+Define expressions such as `${DB_HOST}` in the value stored in Infisical, not in the `external_secrets` locator.
 
 For example, an Infisical secret named `DATABASE_URL` can contain:
 
@@ -63,29 +62,32 @@ external_secrets:
   DATABASE_URL: 0db45926-c97c-40d4-a3aa-fefd5d5fb492:prod:DATABASE_URL
 ```
 
-Infisical resolves `${DB_HOST}` before doco-cd injects `DATABASE_URL` into the
-Compose project.
+Infisical resolves `${DB_HOST}`server-side before doco-cd injects `DATABASE_URL` into the Compose project.
 
 !!! warning "Validate reference permissions"
-    Infisical secret-reference expansion requires access to every secret in the
-    reference chain. Depending on the Infisical server and API behavior, a
-    resolution problem can fail the request or leave reference text unresolved.
-    The SDK does not expose a separate "fully resolved" status, so doco-cd trusts
-    and injects the value returned by Infisical. Validate the machine identity's
-    permissions and the expanded value in Infisical before deployment.
+    Infisical secret-reference expansion requires access to every secret in the reference chain. 
+    Missing permissions fail the request outright (doco-cd surfaces this as an error).
+    If a referenced secret doesn't exist (wrong key, wrong path, or deleted), Infisical's server 
+    leaves the literal placeholder (e.g. `${DB_HOST}`, `${dev.DB_HOST}`, `${prod.frontend.DB_HOST}` 
+    or the cross-project `${@project-slug.prod.DB_HOST}`) 
+    untouched in the returned value instead of failing the request. 
+    Since the SDK does not expose a separate "fully resolved" status for this case, doco-cd inspects the returned value 
+    itself and fails the deployment if it still contains a reference expression, rather than injecting the unresolved 
+    placeholder text. Validate the referenced secret's key, path, and environment in Infisical before deployment.
 
 ## Combining both interpolation layers
 
 [`INTERPOLATE_EXTERNAL_SECRETS`](../External-Secrets/index.md#with-interpolation) applies only to the locator in `.doco-cd.yml`.
-Infisical secret references apply later, inside the value fetched from
-Infisical. For example:
+Infisical secret references apply later, inside the value fetched from Infisical. 
+
+For example:
 
 ```yaml title=".doco-cd.yml"
 external_secrets:
   DATABASE_URL: "0db45926-c97c-40d4-a3aa-fefd5d5fb492:${PROJECT_STAGE:-prod}:DATABASE_URL"
 ```
 
-With `INTERPOLATE_EXTERNAL_SECRETS=true`, doco-cd first uses `PROJECT_STAGE` to
-select the Infisical environment. Infisical then retrieves `DATABASE_URL` from
-that environment and expands references such as `${DB_HOST}` in its stored
-value.
+With `INTERPOLATE_EXTERNAL_SECRETS=true`, doco-cd first uses `PROJECT_STAGE` to select the Infisical environment. 
+Infisical then retrieves `DATABASE_URL` from that environment and expands references such as `${DB_HOST}` in its stored value.
+
+[infisical-secret-reference-docs]: https://infisical.com/docs/documentation/platform/secret-reference

@@ -9,7 +9,10 @@ import (
 
 	"github.com/go-git/go-git/v5/plumbing"
 
+	gogit "github.com/go-git/go-git/v5"
+
 	"github.com/kimdre/doco-cd/internal/config"
+	"github.com/kimdre/doco-cd/internal/docker"
 	"github.com/kimdre/doco-cd/internal/git"
 	"github.com/kimdre/doco-cd/internal/logger"
 	"github.com/kimdre/doco-cd/internal/notification"
@@ -31,14 +34,27 @@ func (s *StageManager) RunPostDeployStage(_ context.Context, stageLog *slog.Logg
 	var latestCommit string
 
 	if s.Repository.Source != config.SourceTypeOCI {
-		latestCommit, err = git.GetLatestCommit(s.Repository.Git, s.DeployConfig.Reference)
-		if err != nil {
-			return fmt.Errorf("failed to get latest commit: %w", err)
-		}
+		err = s.withMirrorRead(func(repo *gogit.Repository) error {
+			// This stage reports what this run deployed. A parallel webhook may have
+			// advanced the mirror's branch already, so only resolve the moving ref for
+			// legacy callers that did not record an immutable revision.
+			latestCommit = strings.TrimSpace(s.Repository.Revision)
+			if latestCommit == "" {
+				latestCommit, err = git.GetLatestCommit(repo, s.DeployConfig.Reference)
+				if err != nil {
+					return fmt.Errorf("failed to get latest commit: %w", err)
+				}
+			}
 
-		shortCommit, err = git.GetShortestUniqueCommitHash(s.Repository.Git, latestCommit, git.DefaultShortSHALength)
+			shortCommit, err = git.GetShortestUniqueCommitHash(repo, latestCommit, git.DefaultShortSHALength)
+			if err != nil {
+				return fmt.Errorf("failed to get short commit SHA: %w", err)
+			}
+
+			return nil
+		})
 		if err != nil {
-			return fmt.Errorf("failed to get short commit SHA: %w", err)
+			return err
 		}
 	}
 
@@ -53,12 +69,32 @@ func (s *StageManager) RunPostDeployStage(_ context.Context, stageLog *slog.Logg
 	metadata.ChangedServices = s.DeployState.changedServiceNames()
 
 	if s.DeployState.DeployedCommit != "" && latestCommit != "" {
-		metadata.Commits, err = git.GetCommitsBetween(
-			s.Repository.Git,
-			plumbing.NewHash(s.DeployState.DeployedCommit),
-			plumbing.NewHash(latestCommit),
-			maxChangelogCommits,
+		// Only commits that touch the files of this stack belong in its changelog, so a
+		// repository with several stacks does not report the changes of all of them.
+		// A nil filter walks the log unfiltered, which is what a project without any
+		// resolvable path in the repository falls back to.
+		// The deployment configuration is passed alongside the project because it is not
+		// part of it: it declares the stack and holds its image tags, so a commit that
+		// touches only it is precisely the commit that caused this deploy.
+		pathFilter, filterErr := docker.ProjectPathFilter(
+			s.Repository.PathExternal,
+			s.Docker.Project,
+			s.DeployConfig.Internal.File,
 		)
+		if filterErr != nil {
+			stageLog.Warn("failed to build changelog path filter, listing all commits", logger.ErrAttr(filterErr))
+		}
+
+		metadata.Commits, err = mirrorRead(s, func(repo *gogit.Repository) ([]git.CommitInfo, error) {
+			return git.GetCommitsBetween(
+				stageLog,
+				repo,
+				plumbing.NewHash(s.DeployState.DeployedCommit),
+				plumbing.NewHash(latestCommit),
+				maxChangelogCommits,
+				pathFilter,
+			)
+		})
 		if err != nil {
 			// changelog is best-effort, never block the notification
 			stageLog.Warn("failed to build commit changelog", logger.ErrAttr(err))

@@ -11,9 +11,12 @@ tags:
 
 ## Configuration
 
-Poll configurations can be set using the `POLL_CONFIG` environment variable or by providing a file with the `POLL_CONFIG_FILE` environment variable.
+| Key                | Type   | Description                                                                                                                     | Default                    |
+|--------------------|--------|---------------------------------------------------------------------------------------------------------------------------------|----------------------------|
+| `POLL_CONFIG`      | list   | A list/array of poll configurations provided in YAML format (see [Poll Settings](Poll-Settings.md))                             | Ignored when not specified |
+| `POLL_CONFIG_FILE` | string | Path to the file inside the container containing the poll configurations in YAML format (see [Poll Settings](Poll-Settings.md)) | Ignored when not specified |
 
-For Git sources, poll jobs also honor global source URL rewrites from [`SOURCE_URL_REWRITES`](App-Settings.md#source-url-rewrites). This is useful when polling should clone through an internal host/port instead of the public URL.
+For Git sources, poll jobs also honor global source URL rewrites from [`SOURCE_URL_REWRITES`](Advanced/Source-URL-Rewrites.md). This is useful when polling should clone through an internal host/port instead of the public URL.
 
 They must be in the format of a YAML list/array (also called YAML Sequence) and can contain the following settings:
 
@@ -193,6 +196,13 @@ See more at [Polling Local Filesystem Repositories](Advanced/Local-Filesystem-Po
 Inline deployments reuse the same fields as `.doco-cd.yml` files (See [Deploy Settings](Deploy-Settings.md)), including support for external secrets and destroy workflows. The poll job `url` is always used as the deployment source URL.
 
 If the poll config has an inline deployment config and the target repository also contains a `.doco-cd.yml` file, the file will be ignored in favor of the inline deployment config.
+
+Matching Git webhooks also reuse inline deployments. A poll entry matches a webhook when its repository, reference, and optional `target` match the webhook request. Short branch names such as `main` are equivalent to full branch references such as `refs/heads/main`.
+
+!!! warning "Inline configuration takes precedence"
+    When one or more inline poll entries match a webhook, their deployments are combined and the repository's `.doco-cd.yml` is ignored. Inline and repository configurations are never merged. Repository configuration discovery is used only when no inline poll entry matches.
+
+    Deployment names must remain unique within each Docker context across all matching inline entries.
 
 ```yaml title="Poll Config with inline deploy config"
 - url: https://github.com/example/app.git

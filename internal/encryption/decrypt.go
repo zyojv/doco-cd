@@ -1,6 +1,7 @@
 package encryption
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -16,6 +17,7 @@ import (
 	"github.com/go-git/go-billy/v5/osfs"
 	"github.com/go-git/go-git/v5/plumbing/format/gitignore"
 
+	"github.com/kimdre/doco-cd/internal/common/types/set"
 	"github.com/kimdre/doco-cd/internal/filesystem"
 )
 
@@ -31,6 +33,8 @@ func DecryptFile(path string) ([]byte, error) {
 	if !SopsKeyIsSet() {
 		return nil, errSopsKeyNotSet
 	}
+
+	path = filepath.Clean(path)
 
 	content, err := os.ReadFile(path) // #nosec G304
 	if err != nil {
@@ -49,14 +53,33 @@ func DecryptContent(content []byte, format formats.Format) ([]byte, error) {
 }
 
 // DecryptFilesInDirectory walks through the specified directory and decrypts all SOPS-encrypted files.
+// A file that cannot be decrypted aborts the walk.
 func DecryptFilesInDirectory(repoPath, dirPath string) ([]string, error) {
-	return decryptFilesInDirectory(repoPath, dirPath, make(map[string]struct{}))
+	return decryptFilesInDirectory(repoPath, dirPath, set.New[string](), nil)
+}
+
+// DecryptFilesInDirectoryTolerant behaves like DecryptFilesInDirectory, except
+// that a file which cannot be decrypted is reported to onFileError and left
+// untouched instead of aborting the walk.
+//
+// This is for callers that decrypt speculatively, without knowing which files
+// are actually going to be used: a repository may legitimately contain secrets
+// encrypted for a different recipient, and those must not make the whole
+// directory unusable. Callers that know a file is required must still fail on
+// it themselves - reaching a file that is still ciphertext is an error there.
+func DecryptFilesInDirectoryTolerant(repoPath, dirPath string, onFileError func(path string, err error)) ([]string, error) {
+	if onFileError == nil {
+		onFileError = func(string, error) {}
+	}
+
+	return decryptFilesInDirectory(repoPath, dirPath, set.New[string](), onFileError)
 }
 
 // decryptFilesInDirectory is the recursive implementation of DecryptFilesInDirectory.
 // The visited set tracks already-processed real paths to prevent infinite recursion
 // caused by symlink loops (e.g. a symlink pointing to an ancestor directory).
-func decryptFilesInDirectory(repoPath, dirPath string, visited map[string]struct{}) ([]string, error) {
+// onFileError, when non-nil, absorbs per-file decryption failures.
+func decryptFilesInDirectory(repoPath, dirPath string, visited set.Set[string], onFileError func(path string, err error)) ([]string, error) {
 	if !filesystem.InBasePath(repoPath, dirPath) {
 		return nil, fmt.Errorf("%w: %s is outside the repository root %s", filesystem.ErrPathTraversal, dirPath, repoPath)
 	}
@@ -67,11 +90,11 @@ func decryptFilesInDirectory(repoPath, dirPath string, visited map[string]struct
 		realPath = filepath.Clean(dirPath)
 	}
 
-	if _, ok := visited[realPath]; ok {
+	if visited.Contains(realPath) {
 		return nil, nil
 	}
 
-	visited[realPath] = struct{}{}
+	visited.Add(realPath)
 
 	var decryptedFiles []string
 
@@ -123,7 +146,7 @@ func decryptFilesInDirectory(repoPath, dirPath string, visited map[string]struct
 			}
 
 			// Recursively walk the symlink target
-			_, err = decryptFilesInDirectory(repoPath, absTarget, visited)
+			_, err = decryptFilesInDirectory(repoPath, absTarget, visited, onFileError)
 			if errors.Is(err, filesystem.ErrPathTraversal) {
 				return nil
 			}
@@ -137,7 +160,13 @@ func decryptFilesInDirectory(repoPath, dirPath string, visited map[string]struct
 
 		decrypted, err := DecryptFileInPlace(path)
 		if err != nil {
-			return fmt.Errorf("failed to decrypt file %s: %w", path, err)
+			if onFileError == nil {
+				return fmt.Errorf("failed to decrypt file %s: %w", path, err)
+			}
+
+			onFileError(path, err)
+
+			return nil
 		}
 
 		if decrypted {
@@ -152,6 +181,8 @@ func decryptFilesInDirectory(repoPath, dirPath string, visited map[string]struct
 
 // IsEncryptedFile checks if the file at the given path is a SOPS-encrypted file.
 func IsEncryptedFile(path string) (bool, error) {
+	path = filepath.Clean(path)
+
 	content, err := os.ReadFile(path) // #nosec G304
 	if err != nil {
 		return false, err
@@ -240,8 +271,40 @@ func DecryptFileInPlace(path string) (bool, error) {
 		return false, fmt.Errorf("failed to read file %s: %w", path, err)
 	}
 
-	format, encrypted := DetectFormat(content, path)
-	if !encrypted {
+	return lockedDecryptToFile(path, content)
+}
+
+// DecryptToFile decrypts encrypted and writes the plaintext to path, without
+// ever placing the ciphertext itself on disk. It reports false and leaves path
+// untouched when encrypted carries no SOPS metadata.
+//
+// The path must be absolute so that it cannot be resolved relative to an
+// unexpected working directory.
+func DecryptToFile(path string, encrypted []byte) (bool, error) {
+	path = filepath.Clean(path)
+
+	if !filepath.IsAbs(path) {
+		return false, fmt.Errorf("%w: path must be absolute: %s", filesystem.ErrInvalidFilePath, path)
+	}
+
+	lock := acquireFileLock(path)
+	defer releaseFileLock(path, lock)
+
+	return lockedDecryptToFile(path, encrypted)
+}
+
+// lockedDecryptToFile is the shared core of DecryptFileInPlace and
+// DecryptToFile: it detects, decrypts and writes encrypted's plaintext to the
+// already-validated path. Callers must hold path's file lock, since the
+// compare-then-write below must not interleave with another decryption of the
+// same path.
+//
+// The write is skipped when path already holds exactly that plaintext, so
+// processes watching the file (e.g. a bind-mounted config consumed by a container)
+// are not woken for content that did not change.
+func lockedDecryptToFile(path string, encrypted []byte) (bool, error) {
+	format, isEncrypted := DetectFormat(encrypted, path)
+	if !isEncrypted {
 		return false, nil
 	}
 
@@ -249,15 +312,17 @@ func DecryptFileInPlace(path string) (bool, error) {
 		return false, errSopsKeyNotSet
 	}
 
-	decryptedContent, err := DecryptContent(content, format)
+	decryptedContent, err := DecryptContent(encrypted, format)
 	if err != nil {
-		return false, fmt.Errorf("failed to decrypt file %s: %w", path, err)
+		return false, fmt.Errorf("failed to decrypt content for %s: %w", path, err)
 	}
 
-	// #nosec G703 -- path is cleaned, required to be absolute and verified to be a regular
-	// file above, and is the same file that was just read.
-	err = os.WriteFile(path, decryptedContent, filesystem.PermOwner)
-	if err != nil {
+	if current, readErr := os.ReadFile(path); readErr == nil && bytes.Equal(current, decryptedContent) { // #nosec G304 -- path validated by callers
+		return true, nil
+	}
+
+	// #nosec G703 -- path is cleaned and required to be absolute by callers.
+	if err = os.WriteFile(path, decryptedContent, filesystem.PermOwner); err != nil {
 		return false, fmt.Errorf("failed to write file %s: %w", path, err)
 	}
 

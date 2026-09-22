@@ -2,11 +2,13 @@ package deploy
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path"
@@ -20,12 +22,16 @@ import (
 	"go.yaml.in/yaml/v4"
 
 	"github.com/kimdre/doco-cd/internal/common/defaults"
+	"github.com/kimdre/doco-cd/internal/common/types/set"
 	"github.com/kimdre/doco-cd/internal/common/validation"
 
 	"github.com/kimdre/doco-cd/internal/config"
 	secrettypes "github.com/kimdre/doco-cd/internal/secretprovider/types"
 
 	gitInternal "github.com/kimdre/doco-cd/internal/git"
+
+	sourcecache "github.com/kimdre/doco-cd/internal/source/cache"
+	"github.com/kimdre/doco-cd/internal/source/store"
 
 	"github.com/kimdre/doco-cd/internal/logger"
 )
@@ -58,38 +64,43 @@ type configFileCacheEntry struct {
 
 // Config is the structure of the deployment configuration file.
 type Config struct {
-	Name               string                                   `yaml:"name" json:"name" doco:"allowOverride"`                                                                                                                  // Name of the docker-compose deployment / stack
-	Source             config.SourceType                        `yaml:"source" json:"source" default:"git"`                                                                                                                     // Source selects the deployment source backend (git or oci)
-	Version            string                                   `yaml:"version" json:"version" default:"doco.v1" doco:"allowOverride"`                                                                                          // Version declares the deployment config schema/artifact version for OCI-backed deployments
-	RepositoryUrl      config.GitUrl                            `yaml:"repository_url" json:"repository_url" default:"" validate:"gitUrl"`                                                                                      // RepositoryUrl is the Git clone URL of the repository to deploy
-	WebhookEventFilter string                                   `yaml:"webhook_filter" json:"webhook_filter" default:"" doco:"allowOverride"`                                                                                   // WebhookEventFilter is a regular expression to whitelist deployment triggers based on the webhook event payload (e.g., branch like "^refs/heads/main$" or "main", tag like "^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$" or "v[0-9]+\.[0-9]+\.[0-9]+")
-	Reference          string                                   `yaml:"reference" json:"reference" default:""`                                                                                                                  // Reference is the Git reference to the deployment, e.g., refs/heads/main, main, refs/tags/v1.0.0 or v1.0.0
-	WorkingDirectory   string                                   `yaml:"working_dir" json:"working_dir" default:"." doco:"allowOverride"`                                                                                        // WorkingDirectory is the working directory for the deployment
-	Context            string                                   `yaml:"context" json:"context" default:"" doco:"allowOverride"`                                                                                                 // Context is the Docker context to use for this deployment (empty uses the default Docker context)
-	ComposeFiles       []string                                 `yaml:"compose_files" json:"compose_files" default:"[\"compose.yaml\", \"compose.yml\", \"docker-compose.yml\", \"docker-compose.yaml\"]" doco:"allowOverride"` // ComposeFiles is the list of docker-compose files to use
-	Environment        map[string]string                        `yaml:"environment" json:"environment" doco:"allowOverride"`                                                                                                    // Environment is a map of environment variables to use for variable interpolation in the compose files
-	EnvFiles           []string                                 `yaml:"env_files" json:"env_files" default:"[\".env\"]" doco:"allowOverride"`                                                                                   // EnvFiles is the list of dotenv files to use for variable interpolation
-	RemoveOrphans      bool                                     `yaml:"remove_orphans" json:"remove_orphans" default:"true" doco:"allowOverride"`                                                                               // RemoveOrphans removes containers for services not defined in the Compose file
-	PruneImages        bool                                     `yaml:"prune_images" json:"prune_images" default:"true" doco:"allowOverride"`                                                                                   // PruneImages removes images that are no longer used by any service
-	Swarm              SwarmConfig                              `yaml:"swarm" json:"swarm" doco:"allowOverride"`                                                                                                                // Swarm contains Docker Swarm-specific deployment settings
-	WaitRunningJobs    bool                                     `yaml:"wait_running_jobs" json:"wait_running_jobs" default:"true" doco:"allowOverride"`                                                                         // WaitRunningJobs waits for currently running scheduled job containers/services to finish before deployment
-	ForceRecreate      bool                                     `yaml:"force_recreate" json:"force_recreate" default:"false" doco:"allowOverride"`                                                                              // ForceRecreate forces the recreation/redeployment of containers even if the configuration has not changed
-	ForceImagePull     bool                                     `yaml:"force_image_pull" json:"force_image_pull" default:"false" doco:"allowOverride"`                                                                          // ForceImagePull always pulls the latest version of the image tags you've specified if a newer version is available
-	Timeout            int                                      `yaml:"timeout" json:"timeout" default:"180" doco:"allowOverride"`                                                                                              // Timeout is the time in seconds to wait for the deployment to finish before timing out
-	BuildOpts          BuildConfig                              `yaml:"build" json:"build" doco:"allowOverride"`                                                                                                                // BuildOpts is the build options for the deployment
-	GitDepth           int                                      `yaml:"git_depth" json:"git_depth" default:"0"`                                                                                                                 // GitDepth limits the number of commits to fetch. 0 means use global GIT_CLONE_DEPTH. A positive value overrides the global setting.
-	Destroy            DestroyConfig                            `yaml:"destroy" json:"destroy" doco:"allowOverride"`                                                                                                            // Destroy configures destruction of the deployment and related resources
-	Profiles           []string                                 `yaml:"profiles" json:"profiles" default:"[]" doco:"allowOverride"`                                                                                             // Profiles is a list of profiles to use for the deployment, e.g., ["dev", "prod"]. See https://docs.docker.com/compose/how-tos/profiles/
-	ExternalSecrets    map[string]secrettypes.ExternalSecretRef `yaml:"external_secrets" json:"external_secrets" doco:"allowOverride"`                                                                                          // ExternalSecrets maps env vars to legacy string references or structured references (e.g. webhook store_ref/remote_ref).
-	AutoDiscovery      AutoDiscoveryConfig                      `yaml:"auto_discovery" json:"auto_discovery"`                                                                                                                   // AutoDiscovery configures autodiscovery of services to deploy in the working directory
-	Reconciliation     ReconciliationConfig                     `yaml:"reconciliation" json:"reconciliation" doco:"allowOverride"`                                                                                              // Reconciliation is the configuration for the reconciliation feature
-	Oci                config.OciTrustPolicyOverride            `yaml:"oci" json:"oci" doco:"allowOverride"`                                                                                                                    // Oci allows per-target overrides for OCI signature verification policy
-	Internal           struct {
-		File                          string            `yaml:"-"` // File is the path to the deployment configuration file
-		ConfigTarget                  string            `yaml:"-"` // ConfigTarget is the target suffix from the deployment config filename (e.g., "nas" for .doco-cd.nas.yml)
-		Environment                   map[string]string // Environment stores environment variables for variable interpolation in the compose project
-		Hash                          string            `yaml:"-"`          // Hash is a hash of the Config struct
-		OciTrustPolicyOverrideTrusted bool              `yaml:"-" json:"-"` // true only for trusted config sources (e.g. POLL_CONFIG inline deployments)
+	Name                 string                                   `yaml:"name" json:"name" doco:"allowOverride"`                                                                                                                  // Name of the docker-compose deployment / stack
+	Source               config.SourceType                        `yaml:"source" json:"source" default:"git"`                                                                                                                     // Source selects the deployment source backend (git or oci)
+	Version              string                                   `yaml:"version" json:"version" default:"doco.v1" doco:"allowOverride"`                                                                                          // Version declares the deployment config schema/artifact version for OCI-backed deployments
+	RepositoryUrl        config.GitUrl                            `yaml:"repository_url" json:"repository_url" default:"" validate:"gitUrl"`                                                                                      // RepositoryUrl is the Git clone URL of the repository to deploy
+	WebhookEventFilter   string                                   `yaml:"webhook_filter" json:"webhook_filter" default:"" doco:"allowOverride"`                                                                                   // WebhookEventFilter is a regular expression to whitelist deployment triggers based on the webhook event payload (e.g., branch like "^refs/heads/main$" or "main", tag like "^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$" or "v[0-9]+\.[0-9]+\.[0-9]+")
+	Reference            string                                   `yaml:"reference" json:"reference" default:""`                                                                                                                  // Reference is the Git reference to the deployment, e.g., refs/heads/main, main, refs/tags/v1.0.0 or v1.0.0
+	WorkingDirectory     string                                   `yaml:"working_dir" json:"working_dir" default:"." doco:"allowOverride"`                                                                                        // WorkingDirectory is the working directory for the deployment
+	Context              string                                   `yaml:"context" json:"context" default:"" doco:"allowOverride"`                                                                                                 // Context is the Docker context to use for this deployment (empty uses the default Docker context)
+	ComposeFiles         []string                                 `yaml:"compose_files" json:"compose_files" default:"[\"compose.yaml\", \"compose.yml\", \"docker-compose.yml\", \"docker-compose.yaml\"]" doco:"allowOverride"` // ComposeFiles is the list of docker-compose files to use
+	Environment          map[string]string                        `yaml:"environment" json:"environment" doco:"allowOverride"`                                                                                                    // Environment is a map of environment variables to use for variable interpolation in the compose files
+	EnvFiles             []string                                 `yaml:"env_files" json:"env_files" default:"[\".env\"]" doco:"allowOverride"`                                                                                   // EnvFiles is the list of dotenv files to use for variable interpolation
+	RemoveOrphans        bool                                     `yaml:"remove_orphans" json:"remove_orphans" default:"true" doco:"allowOverride"`                                                                               // RemoveOrphans removes containers for services not defined in the Compose file
+	PruneImages          bool                                     `yaml:"prune_images" json:"prune_images" default:"true" doco:"allowOverride"`                                                                                   // PruneImages removes images that are no longer used by any service
+	Swarm                SwarmConfig                              `yaml:"swarm" json:"swarm" doco:"allowOverride"`                                                                                                                // Swarm contains Docker Swarm-specific deployment settings
+	WaitRunningJobs      bool                                     `yaml:"wait_running_jobs" json:"wait_running_jobs" default:"true" doco:"allowOverride"`                                                                         // WaitRunningJobs waits for currently running scheduled job containers/services to finish before deployment
+	ForceRecreate        bool                                     `yaml:"force_recreate" json:"force_recreate" default:"false" doco:"allowOverride"`                                                                              // ForceRecreate forces the recreation/redeployment of containers even if the configuration has not changed
+	ForceImagePull       bool                                     `yaml:"force_image_pull" json:"force_image_pull" default:"false" doco:"allowOverride"`                                                                          // ForceImagePull always pulls the latest version of the image tags you've specified if a newer version is available
+	Timeout              int                                      `yaml:"timeout" json:"timeout" default:"180" doco:"allowOverride"`                                                                                              // Timeout is the time in seconds to wait for the deployment to finish before timing out
+	BuildOpts            BuildConfig                              `yaml:"build" json:"build" doco:"allowOverride"`                                                                                                                // BuildOpts is the build options for the deployment
+	GitDepth             int                                      `yaml:"git_depth" json:"git_depth" default:"0"`                                                                                                                 // GitDepth limits the number of commits to fetch. 0 means use global GIT_CLONE_DEPTH. A positive value overrides the global setting.
+	Destroy              DestroyConfig                            `yaml:"destroy" json:"destroy" doco:"allowOverride"`                                                                                                            // Destroy configures destruction of the deployment and related resources
+	Profiles             []string                                 `yaml:"profiles" json:"profiles" default:"[]" doco:"allowOverride"`                                                                                             // Profiles is a list of profiles to use for the deployment, e.g., ["dev", "prod"]. See https://docs.docker.com/compose/how-tos/profiles/
+	ExternalSecrets      map[string]secrettypes.ExternalSecretRef `yaml:"external_secrets" json:"external_secrets" doco:"allowOverride"`                                                                                          // ExternalSecrets maps env vars to legacy string references or structured references (e.g. webhook store_ref/remote_ref).
+	ExternalSecretsFiles []string                                 `yaml:"external_secrets_files" json:"external_secrets_files" default:"[]" doco:"allowOverride"`                                                                 // ExternalSecretsFiles is a list of YAML files, each holding a map of env var name to external secret reference (same shape as ExternalSecrets). Files are merged first, then ExternalSecrets entries are applied on top (inline wins on key collision).
+	AutoDiscovery        AutoDiscoveryConfig                      `yaml:"auto_discovery" json:"auto_discovery"`                                                                                                                   // AutoDiscovery configures autodiscovery of services to deploy in the working directory
+	Reconciliation       ReconciliationConfig                     `yaml:"reconciliation" json:"reconciliation" doco:"allowOverride"`                                                                                              // Reconciliation is the configuration for the reconciliation feature
+	Oci                  config.OciTrustPolicyOverride            `yaml:"oci" json:"oci" doco:"allowOverride"`                                                                                                                    // Oci allows per-target overrides for OCI signature verification policy
+	Internal             struct {
+		File                          string                                   `yaml:"-"` // File is the path to the deployment configuration file
+		ConfigTarget                  string                                   `yaml:"-"` // ConfigTarget is the target suffix from the deployment config filename (e.g., "nas" for .doco-cd.nas.yml)
+		Environment                   map[string]string                        // Environment stores environment variables for variable interpolation in the compose project
+		ExternalSecretsFromFiles      map[string]secrettypes.ExternalSecretRef // ExternalSecretsFromFiles accumulates entries loaded from ExternalSecretsFiles across local and remote loads, merged into ExternalSecrets by MergeExternalSecretsFromFiles
+		Hash                          string                                   `yaml:"-"`          // Hash is a hash of the Config struct
+		OciTrustPolicyOverrideTrusted bool                                     `yaml:"-" json:"-"` // true only for trusted config sources (e.g. POLL_CONFIG inline deployments)
+		ConfigSourceFilesLoaded       bool                                     `yaml:"-" json:"-"` // Config-source env and external-secret files have been loaded
+		ConfigSourceRevision          string                                   `yaml:"-" json:"-"` // Immutable revision containing this deployment config
+		ConfigSourceWorkingDir        string                                   `yaml:"-" json:"-"` // Host path to the config source artifact
 	} `json:"-"` // Internal holds internal configuration values that are not set by the user
 }
 
@@ -363,10 +374,22 @@ func getConfigFromYAMLBytes(contents []byte, fileName string, applyDefaults bool
 	return configs, nil
 }
 
-// GetConfigs returns deployment configurations discovered in the repository.
-// It fails when no matching deployment configuration file exists.
-// gitOpts is optional (can be nil) and is only required when AutoDiscovery with a remote RepositoryUrl is used.
-func GetConfigs(repoRoot, configBaseDir, customTarget, reference string, gitOpts *GitOptions) ([]*Config, error) {
+// remoteDiscoveryStoreDir returns the shared store directory for remote auto-discovery, or the legacy sibling fallback.
+func remoteDiscoveryStoreDir(sourceBaseDir, repoRoot, repositoryURL string) string {
+	repoName := gitInternal.GetRepoName(repositoryURL)
+
+	if sourceBaseDir == "" {
+		// No base directory supplied (e.g. scheduled runs, which pass no
+		// git options at all); fall back to the legacy sibling guess.
+		return path.Join(path.Dir(repoRoot), repoName)
+	}
+
+	return filepath.Join(sourceBaseDir, repoName)
+}
+
+// GetConfigs returns deployment configurations discovered in repoRoot. gitMirrorRoot and primaryRevision identify the
+// Git source when repoRoot is a published artifact.
+func GetConfigs(ctx context.Context, repoRoot, configBaseDir, customTarget, reference, gitMirrorRoot, primaryRevision string, gitOpts *GitOptions) ([]*Config, error) {
 	configDir := filepath.Join(repoRoot, configBaseDir)
 
 	files, err := os.ReadDir(configDir)
@@ -388,44 +411,61 @@ func GetConfigs(repoRoot, configBaseDir, customTarget, reference string, gitOpts
 		DeploymentConfigFileNames = DefaultDeploymentConfigFileNames
 	}
 
-	// Get repo and change to reference in c.Reference if it is different to the current reference in the repoRoot,
-	// otherwise it will cause issues with the auto-discovery.
-	// For non-git sources (e.g. OCI), the directory is not a git repository, so we skip git operations.
-	baseRepo, err := git.PlainOpen(repoRoot)
+	// gitOpenRoot is used only for read-only reference resolution. It defaults to repoRoot, or uses gitMirrorRoot when
+	// repoRoot is not a Git checkout.
+	// Non-Git sources skip these operations.
+	gitOpenRoot := repoRoot
+	if gitMirrorRoot != "" {
+		gitOpenRoot = gitMirrorRoot
+	}
+
+	// acquireMirrorReadLock guards read-only access to the shared bare mirror's object database and refs.
+	// GitStore.Resolve/Publish only exclude each other via the matching exclusive lock, so an unguarded read
+	// can observe the mirror mid-fetch while another deployment of the same repository runs concurrently.
+	// The lock is not reentrant, so it must never be held across a call that publishes into the same mirror.
+	acquireMirrorReadLock := func(mirrorDir string) func() {
+		if mirrorDir == "" {
+			return func() {}
+		}
+
+		return sourcecache.AcquireSharedPathLock(mirrorDir)
+	}
+
+	// openGitRead opens a fresh handle on the repository for a single read region.
+	//
+	// The handle must never be reused across lock regions: go-git caches a handle's
+	// packfile index map on first use and never refreshes it, so a handle that was
+	// opened before another deployment fetched into the same mirror enumerates a
+	// packfile it has no index for and segfaults inside go-git. Every caller below
+	// opens its own handle while holding the matching shared lock and drops it again.
+	openGitRead := func() (*git.Repository, error) {
+		repo, openErr := git.PlainOpen(gitOpenRoot)
+		if openErr != nil {
+			return nil, fmt.Errorf("failed to open git repository at %s: %w", gitOpenRoot, openErr)
+		}
+
+		return repo, nil
+	}
+
+	unlockMirror := acquireMirrorReadLock(gitMirrorRoot)
+	_, err = git.PlainOpen(gitOpenRoot)
+
+	unlockMirror()
+
 	isGitRepo := true
 
 	if err != nil {
 		if !errors.Is(err, git.ErrRepositoryNotExists) {
-			return nil, fmt.Errorf("failed to open git repository at %s: %w", repoRoot, err)
+			return nil, fmt.Errorf("failed to open git repository at %s: %w", gitOpenRoot, err)
 		}
 
 		isGitRepo = false
 	}
 
-	if isGitRepo {
-		// Compare the resolved reference with the current HEAD reference, if they are different then skip the auto-discovery for this deployment config
-		headRef, err := baseRepo.Head()
-		if err != nil {
-			return nil, fmt.Errorf("%w: %w", gitInternal.ErrGetHeadFailed, err)
-		}
-
-		// Checkout repo to different reference
-		w, err := baseRepo.Worktree()
-		if err != nil {
-			return nil, fmt.Errorf("failed to get git worktree: %w", err)
-		}
-
-		// Defer checkout back to original HEAD reference after the deployment is done
-		defer func(branch plumbing.ReferenceName) {
-			err = w.Checkout(&git.CheckoutOptions{
-				Branch: branch,
-				Keep:   true,
-			})
-			if err != nil {
-				slog.Error("failed to checkout back to original HEAD reference after deployment", "error", err)
-			}
-		}(headRef.Name())
-	}
+	// gitRepoLabelRoot names the repository for auto-discovery's metrics labels and default stack naming.
+	// repoRoot may be an anonymous per-revision artifact path (e.g. named after a commit SHA or an OCI
+	// digest), which would make both revision-dependent, so a revision-stable directory is derived instead.
+	gitRepoLabelRoot := repositoryLabelRoot(repoRoot, gitMirrorRoot)
 
 	var configs []*Config
 	for _, configFile := range DeploymentConfigFileNames {
@@ -459,38 +499,188 @@ func GetConfigs(repoRoot, configBaseDir, customTarget, reference string, gitOpts
 			repoDir := repoRoot
 			// Check for configs with AutoDiscover enabled, if true then remove this config and add new configs based on discovered compose files
 			if c.AutoDiscovery.Enabled {
-				if c.RepositoryUrl != "" {
-					auth, err := gitInternal.GetAuthMethod(string(c.RepositoryUrl), opts.SSHPrivateKey, opts.SSHPrivateKeyPassphrase, opts.GitAccessToken)
+				var discoveredConfigs []*Config
+
+				switch {
+				case c.RepositoryUrl != "":
+					repoDir = remoteDiscoveryStoreDir(opts.SourceBaseDir, repoRoot, string(c.RepositoryUrl))
+
+					// GitStore locks the mirror during fetch. Discovery reads the resolved tree directly
+					// instead of publishing and decrypting an artifact.
+					remoteStore, err := store.NewGitStore(store.GitStoreOptions{
+						Log:                     slog.Default(),
+						CloneURL:                string(c.RepositoryUrl),
+						BaseDir:                 repoDir,
+						SSHPrivateKey:           opts.SSHPrivateKey,
+						SSHPrivateKeyPassphrase: opts.SSHPrivateKeyPassphrase,
+						AccessToken:             opts.GitAccessToken,
+						SkipTLSVerify:           opts.SkipTLSVerification,
+						ProxyOptions:            opts.HttpProxy,
+						CloneSubmodules:         opts.GitCloneSubmodules,
+						Depth:                   c.ResolveGitDepth(opts.GitCloneDepth),
+					})
 					if err != nil {
-						return nil, fmt.Errorf("failed to get auth method: %w", err)
+						return nil, fmt.Errorf("failed to initialize git store for %s: %w", c.RepositoryUrl, err)
 					}
 
-					repoDir = path.Join(path.Dir(repoRoot), gitInternal.GetRepoName(string(c.RepositoryUrl)))
-
-					// Synchronize the repository once, whether it already exists or must be cloned.
-					_, err = gitInternal.SyncRepository(repoDir, string(c.RepositoryUrl), c.Reference, opts.SkipTLSVerification, opts.HttpProxy, auth, opts.GitCloneSubmodules, c.ResolveGitDepth(opts.GitCloneDepth))
+					revision, err := remoteStore.Resolve(ctx, c.Reference)
 					if err != nil {
-						return nil, fmt.Errorf("failed to synchronize repository: %w", err)
-					}
-				} else if isGitRepo {
-					auth, err := gitInternal.GetAuthMethod(string(c.RepositoryUrl), opts.SSHPrivateKey, opts.SSHPrivateKeyPassphrase, opts.GitAccessToken)
-					if err != nil {
-						return nil, fmt.Errorf("failed to get auth method: %w", err)
+						return nil, fmt.Errorf("failed to resolve reference %s: %w", c.Reference, err)
 					}
 
-					unlock := gitInternal.AcquirePathLock(repoRoot)
-					err = gitInternal.CheckoutRepository(baseRepo, c.Reference, auth, opts.GitCloneSubmodules)
+					if opts.GitCloneSubmodules {
+						unlockGC, err := sourcecache.AcquireSharedGCPathLock(repoDir)
+						if err != nil {
+							return nil, fmt.Errorf("failed to acquire artifact GC lock: %w", err)
+						}
 
-					unlock()
+						artifact, errPublish := remoteStore.Publish(ctx, revision)
+						if errPublish != nil {
+							unlockGC()
+							return nil, fmt.Errorf("failed to publish reference %s: %w", c.Reference, errPublish)
+						}
+
+						var discoveryErr error
+
+						discoveredConfigs, discoveryErr = autoDiscoverDeployments(os.DirFS(artifact.Path), repoDir, string(revision), c)
+
+						unlockGC()
+
+						if discoveryErr != nil {
+							return nil, fmt.Errorf("failed to auto-discover deployment configurations: %w", discoveryErr)
+						}
+					} else {
+						// TreeFS reads objects lazily, so the mirror lock must be held across the walk as well.
+						unlockRemoteMirror := acquireMirrorReadLock(remoteStore.MirrorDir())
+
+						discoveredConfigs, err = func() ([]*Config, error) {
+							defer unlockRemoteMirror()
+
+							mirrorRepo, openErr := git.PlainOpen(remoteStore.MirrorDir())
+							if openErr != nil {
+								return nil, fmt.Errorf("failed to open git mirror at %s: %w", remoteStore.MirrorDir(), openErr)
+							}
+
+							treeFS, treeErr := gitInternal.NewTreeFSAtCommit(mirrorRepo, plumbing.NewHash(string(revision)))
+							if treeErr != nil {
+								return nil, fmt.Errorf("failed to open tree for reference %s: %w", c.Reference, treeErr)
+							}
+
+							return autoDiscoverDeployments(treeFS, repoDir, string(revision), c)
+						}()
+						if err != nil {
+							return nil, fmt.Errorf("failed to auto-discover deployment configurations: %w", err)
+						}
+					}
+				case isGitRepo:
+					unlockMirror := acquireMirrorReadLock(gitMirrorRoot)
+
+					baseRepo, err := openGitRead()
+					if err != nil {
+						unlockMirror()
+						return nil, err
+					}
+
+					hash, err := gitInternal.ResolveReferenceCommit(baseRepo, c.Reference)
+					if err != nil {
+						unlockMirror()
+						return nil, fmt.Errorf("failed to resolve reference %s: %w", c.Reference, err)
+					}
+
+					matchesPrimary, err := matchesPrimaryContent(baseRepo, hash, primaryRevision)
+
+					// Released before the switch below: publishing an artifact takes the matching
+					// exclusive lock on the same mirror, which would deadlock on this non-reentrant lock.
+					unlockMirror()
 
 					if err != nil {
-						return nil, fmt.Errorf("failed to checkout repository to reference %s: %w", c.Reference, err)
+						return nil, err
 					}
-				}
 
-				discoveredConfigs, err := autoDiscoverDeployments(repoDir, c)
-				if err != nil {
-					return nil, fmt.Errorf("failed to auto-discover deployment configurations: %w", err)
+					var (
+						fsys                 fs.FS
+						releaseDiscoveryLock func()
+					)
+
+					switch {
+					case matchesPrimary:
+						// Already at the target reference: read repoRoot's content directly so submodules and locally
+						// materialized content (e.g. decrypted files) remain visible.
+						fsys = os.DirFS(repoRoot)
+					case opts.GitCloneSubmodules && gitMirrorRoot != "" && opts.SourceURL != "":
+						baseDir := filepath.Dir(gitMirrorRoot)
+
+						primaryStore, storeErr := store.NewGitStore(store.GitStoreOptions{
+							Log:                     slog.Default(),
+							CloneURL:                opts.SourceURL,
+							BaseDir:                 baseDir,
+							SSHPrivateKey:           opts.SSHPrivateKey,
+							SSHPrivateKeyPassphrase: opts.SSHPrivateKeyPassphrase,
+							AccessToken:             opts.GitAccessToken,
+							SkipTLSVerify:           opts.SkipTLSVerification,
+							ProxyOptions:            opts.HttpProxy,
+							CloneSubmodules:         true,
+							Depth:                   c.ResolveGitDepth(opts.GitCloneDepth),
+						})
+						if storeErr != nil {
+							return nil, fmt.Errorf("failed to initialize git store: %w", storeErr)
+						}
+
+						unlockGC, lockErr := sourcecache.AcquireSharedGCPathLock(baseDir)
+						if lockErr != nil {
+							return nil, fmt.Errorf("failed to acquire artifact GC lock: %w", lockErr)
+						}
+
+						artifact, errPublish := primaryStore.Publish(ctx, store.Revision(hash.String()))
+						if errPublish != nil {
+							unlockGC()
+							return nil, fmt.Errorf("failed to publish reference %s: %w", c.Reference, errPublish)
+						}
+
+						fsys = os.DirFS(artifact.Path)
+						releaseDiscoveryLock = unlockGC
+					default:
+						// Different reference: read from the object database
+						// instead of checking out, to avoid mutating the shared
+						// working tree while other readers/writers may be using it.
+						// TreeFS reads objects lazily, so the mirror lock is held until the walk below finishes.
+						unlockTreeMirror := acquireMirrorReadLock(gitMirrorRoot)
+
+						// Fresh handle for this read region: the one used above was dropped with
+						// its lock, and reusing it across a fetch by another deployment is exactly
+						// what makes go-git dereference a missing packfile index.
+						treeRepo, err := openGitRead()
+						if err != nil {
+							unlockTreeMirror()
+							return nil, err
+						}
+
+						treeFS, err := gitInternal.NewTreeFSAtCommit(treeRepo, hash)
+						if err != nil {
+							unlockTreeMirror()
+							return nil, fmt.Errorf("failed to open tree for reference %s: %w", c.Reference, err)
+						}
+
+						fsys = treeFS
+						releaseDiscoveryLock = unlockTreeMirror
+					}
+
+					discoveredConfigs, err = autoDiscoverDeployments(fsys, gitRepoLabelRoot, hash.String(), c)
+
+					if releaseDiscoveryLock != nil {
+						releaseDiscoveryLock()
+					}
+
+					if err != nil {
+						return nil, fmt.Errorf("failed to auto-discover deployment configurations: %w", err)
+					}
+				default:
+					var err error
+
+					discoveredConfigs, err = autoDiscoverDeployments(os.DirFS(repoRoot), gitRepoLabelRoot, "", c)
+					if err != nil {
+						return nil, fmt.Errorf("failed to auto-discover deployment configurations: %w", err)
+					}
 				}
 
 				// Add the discovered configs to the expanded list
@@ -523,6 +713,38 @@ func GetConfigs(repoRoot, configBaseDir, customTarget, reference string, gitOpts
 	}
 
 	return nil, fmt.Errorf("%w: .doco-cd.y(a)ml", ErrConfigFileNotFound)
+}
+
+// repositoryLabelRoot returns a revision-stable directory whose base name identifies the repository, for
+// auto-discovery's metrics label and default stack name. repoRoot is usually a per-revision artifact directory
+// ("<baseDir>/artifacts/<revision>"), whose name would otherwise change on every commit or digest.
+func repositoryLabelRoot(repoRoot, gitMirrorRoot string) string {
+	if gitMirrorRoot != "" {
+		return filepath.Dir(gitMirrorRoot)
+	}
+
+	artifactsDir := filepath.Dir(filepath.Clean(repoRoot))
+	if filepath.Base(artifactsDir) == store.ArtifactsSubdir {
+		return filepath.Dir(artifactsDir)
+	}
+
+	return repoRoot
+}
+
+// matchesPrimaryContent reports whether hash matches the content already
+// materialized at repoRoot. primaryRevision avoids relying on a mirror's HEAD;
+// when empty, the repository's working-tree HEAD is used.
+func matchesPrimaryContent(baseRepo *git.Repository, hash plumbing.Hash, primaryRevision string) (bool, error) {
+	if primaryRevision != "" {
+		return hash.String() == primaryRevision, nil
+	}
+
+	headRef, err := baseRepo.Head()
+	if err != nil {
+		return false, fmt.Errorf("%w: %w", gitInternal.ErrGetHeadFailed, err)
+	}
+
+	return hash == headRef.Hash(), nil
 }
 
 // getConfigsFromFile returns the deployment configurations from the repository or nil if not found.
@@ -588,34 +810,33 @@ func getCachedConfigsFromFile(fileName string) ([]*Config, error) {
 
 // ValidateUniqueProjectNames checks if project names are unique within each Docker context.
 func ValidateUniqueProjectNames(configs []*Config) error {
-	namesByContext := make(map[string]map[string]bool)
+	namesByContext := make(map[string]set.Set[string])
 	for _, dc := range configs {
 		names, ok := namesByContext[dc.Context]
 		if !ok {
-			names = make(map[string]bool)
+			names = set.New[string]()
 			namesByContext[dc.Context] = names
 		}
 
-		if names[dc.Name] {
+		if names.Contains(dc.Name) {
 			return fmt.Errorf("%w: %s", ErrDuplicateProjectName, dc.Name)
 		}
 
-		names[dc.Name] = true
+		names.Add(dc.Name)
 	}
 
 	return nil
 }
 
-// ResolveConfigs returns Deployment Config's for a poll run, preferring inline
-// deployments defined on the PollConfig when provided. Inline deployments bypass
-// repository config file discovery. When no inline deployments are present,
-// repository config files are required.
-// repoRoot is the absolute path to the repository root.
-// configBaseDir is the relative path from repo root where config files are located.
-// gitOpts is optional (may be nil) and is only required when AutoDiscovery with a remote RepositoryUrl is used.
-func ResolveConfigs(inlineDeployments []*Config, customTarget, reference, repoRoot, configBaseDir string, gitOpts *GitOptions) ([]*Config, error) {
+// ResolveConfigs returns inline deployment configs when supplied; otherwise it reads the repository config files.
+// repoRoot is the absolute repository path, and configBaseDir is the relative config path.
+// gitOpts is optional and only required for AutoDiscovery with a remote RepositoryUrl.
+// gitMirrorRoot and primaryRevision are optional Git-only parameters; see GetConfigs.
+func ResolveConfigs(ctx context.Context, inlineDeployments []*Config, customTarget, reference, repoRoot, configBaseDir, gitMirrorRoot, primaryRevision string, gitOpts *GitOptions) ([]*Config, error) {
 	// Prefer inline deployments when present
 	if len(inlineDeployments) > 0 {
+		inlineDeployments = cloneConfigSlice(inlineDeployments)
+
 		// Apply reference to inline deployments if not already set
 		for _, d := range inlineDeployments {
 			if d.Reference == "" {
@@ -623,7 +844,7 @@ func ResolveConfigs(inlineDeployments []*Config, customTarget, reference, repoRo
 			}
 		}
 
-		configs, err := expandInlineAutoDiscoverConfigs(repoRoot, inlineDeployments)
+		configs, err := expandInlineAutoDiscoverConfigs(repoRoot, repositoryLabelRoot(repoRoot, gitMirrorRoot), primaryRevision, inlineDeployments)
 		if err != nil {
 			return nil, err
 		}
@@ -632,9 +853,13 @@ func ResolveConfigs(inlineDeployments []*Config, customTarget, reference, repoRo
 			cfg.Internal.OciTrustPolicyOverrideTrusted = true
 		}
 
+		if err := ValidateUniqueProjectNames(configs); err != nil {
+			return nil, err
+		}
+
 		return configs, nil
 	}
 
 	// No inline deployments, use repository config discovery
-	return GetConfigs(repoRoot, configBaseDir, customTarget, reference, gitOpts)
+	return GetConfigs(ctx, repoRoot, configBaseDir, customTarget, reference, gitMirrorRoot, primaryRevision, gitOpts)
 }
